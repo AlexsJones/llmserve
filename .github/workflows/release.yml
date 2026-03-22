@@ -116,7 +116,7 @@ jobs:
           echo "CHECKSUM_PATH=${RUNNER_TEMP}/${ASSET_NAME}${ARCHIVE_EXT}.sha256" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ASSET }}
           path: |

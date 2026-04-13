@@ -630,7 +630,10 @@ mod tests {
         let names: std::collections::HashSet<String> =
             models.iter().map(|m| m.name.clone()).collect();
         assert!(names.contains("Qwen3-8B-Q8_0"), "got names: {names:?}");
-        assert!(names.contains("qwen2.5-coder-3b-q8_0"), "got names: {names:?}");
+        assert!(
+            names.contains("qwen2.5-coder-3b-q8_0"),
+            "got names: {names:?}"
+        );
         assert_eq!(names.len(), 2, "names should be distinct, got: {names:?}");
 
         fs::remove_dir_all(&tmp).unwrap();

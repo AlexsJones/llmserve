@@ -144,6 +144,7 @@ fn handle_confirm(app: &mut App, key: KeyEvent) {
         KeyCode::Left | KeyCode::Char('h') => app.confirm_cycle_backend_left(),
         KeyCode::Right | KeyCode::Char('l') => app.confirm_cycle_backend_right(),
         KeyCode::Tab | KeyCode::Char('p') => app.confirm_toggle_port_edit(),
+        KeyCode::Char(' ') => app.toggle_use_ctx_size(),
         _ => {}
     }
 }

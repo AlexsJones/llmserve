@@ -764,6 +764,10 @@ impl App {
         self.confirm_editing_port = !self.confirm_editing_port;
     }
 
+    pub fn toggle_use_ctx_size(&mut self) {
+        self.config.use_ctx_size = !self.config.use_ctx_size;
+    }
+
     pub fn confirm_port_push(&mut self, c: char) {
         if c.is_ascii_digit() && self.confirm_port_input.len() < 5 {
             self.confirm_port_input.push(c);

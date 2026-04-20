@@ -212,12 +212,14 @@ fn launch_llama_server(model: &DiscoveredModel, config: &Config) -> Result<Serve
     let mut cmd = Command::new("llama-server");
     cmd.arg("--model")
         .arg(&model.path)
-        .arg("--ctx-size")
-        .arg(preset.ctx_size.to_string())
         .arg("--host")
         .arg(&preset.host)
         .arg("--port")
         .arg(preset.port.to_string());
+
+    if preset.use_ctx_size {
+        cmd.arg("--ctx-size").arg(preset.ctx_size.to_string());
+    }
 
     if preset.flash_attn {
         cmd.arg("--flash-attn").arg("on");
@@ -299,9 +301,11 @@ fn launch_koboldcpp(model: &DiscoveredModel, config: &Config) -> Result<ServerHa
         .arg("--host")
         .arg(&preset.host)
         .arg("--port")
-        .arg(preset.port.to_string())
-        .arg("--contextsize")
-        .arg(preset.ctx_size.to_string());
+        .arg(preset.port.to_string());
+
+    if preset.use_ctx_size {
+        cmd.arg("--contextsize").arg(preset.ctx_size.to_string());
+    }
 
     if let Some(gpu_layers) = preset.gpu_layers {
         cmd.arg("--gpulayers").arg(gpu_layers.to_string());
@@ -345,9 +349,11 @@ fn launch_localai(model: &DiscoveredModel, config: &Config) -> Result<ServerHand
         .arg("--models-path")
         .arg(models_dir)
         .arg("--address")
-        .arg(format!("{}:{}", preset.host, preset.port))
-        .arg("--context-size")
-        .arg(preset.ctx_size.to_string());
+        .arg(format!("{}:{}", preset.host, preset.port));
+
+    if preset.use_ctx_size {
+        cmd.arg("--context-size").arg(preset.ctx_size.to_string());
+    }
 
     if let Some(threads) = preset.threads {
         cmd.arg("--threads").arg(threads.to_string());
@@ -381,9 +387,11 @@ fn launch_lemonade(model: &DiscoveredModel, config: &Config) -> Result<ServerHan
         .arg("--host")
         .arg(&preset.host)
         .arg("--port")
-        .arg(preset.port.to_string())
-        .arg("--ctx-size")
-        .arg(preset.ctx_size.to_string());
+        .arg(preset.port.to_string());
+
+    if preset.use_ctx_size {
+        cmd.arg("--ctx-size").arg(preset.ctx_size.to_string());
+    }
 
     for arg in &preset.extra_args {
         cmd.arg(arg);

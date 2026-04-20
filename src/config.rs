@@ -7,6 +7,7 @@ use std::path::PathBuf;
 #[serde(default)]
 pub struct BackendPreset {
     pub ctx_size: Option<u32>,
+    pub use_ctx_size: Option<bool>,
     pub host: Option<String>,
     pub port: Option<u16>,
     pub flash_attn: Option<bool>,
@@ -22,6 +23,7 @@ impl Default for BackendPreset {
             ctx_size: None,
             host: None,
             port: None,
+            use_ctx_size: None,
             flash_attn: None,
             batch_size: None,
             gpu_layers: None,
@@ -37,6 +39,7 @@ pub struct Config {
     pub extra_model_dirs: Vec<PathBuf>,
     pub preferred_port: u16,
     pub preferred_host: String,
+    pub use_ctx_size: bool,
     pub default_ctx_size: u32,
     pub flash_attn: bool,
     pub default_backend: Option<String>,
@@ -127,6 +130,7 @@ impl Default for Config {
             extra_model_dirs: Vec::new(),
             preferred_port: 8080,
             preferred_host: "0.0.0.0".into(),
+            use_ctx_size: true,
             default_ctx_size: 8192,
             flash_attn: true,
             default_backend: None,
@@ -167,6 +171,9 @@ impl Config {
             ctx_size: preset
                 .and_then(|p| p.ctx_size)
                 .unwrap_or(self.default_ctx_size),
+            use_ctx_size: preset
+                .and_then(|p| p.use_ctx_size)
+                .unwrap_or(self.use_ctx_size),
             host: preset
                 .and_then(|p| p.host.clone())
                 .unwrap_or_else(|| self.preferred_host.clone()),
@@ -184,6 +191,7 @@ impl Config {
 #[derive(Debug, Clone)]
 pub struct ResolvedPreset {
     pub ctx_size: u32,
+    pub use_ctx_size: bool,
     pub host: String,
     pub port: u16,
     pub flash_attn: bool,

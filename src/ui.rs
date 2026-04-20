@@ -607,6 +607,12 @@ fn draw_confirm_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
         Style::default().fg(tc.accent)
     };
 
+    let use_ctx_size_style = if preset.use_ctx_size {
+        Style::default().fg(tc.accent)
+    } else {
+        Style::default().fg(tc.muted)
+    };
+
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
@@ -634,13 +640,22 @@ fn draw_confirm_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
             ),
         ]),
         Line::from(vec![Span::styled(
-            format!(
-                "  Context: {} │ Flash: {}",
-                preset.ctx_size,
-                if preset.flash_attn { "on" } else { "off" }
-            ),
+            format!("  Flash: {}", if preset.flash_attn { "on" } else { "off" }),
             Style::default().fg(tc.muted),
         )]),
+        Line::from(vec![
+            Span::styled("  Context: ", Style::default().fg(tc.muted)),
+            Span::styled("[", Style::default().fg(tc.muted)),
+            Span::styled(
+                format!("{}", if preset.use_ctx_size { "V" } else { " " },),
+                use_ctx_size_style,
+            ),
+            Span::styled("]", Style::default().fg(tc.muted)),
+            Span::styled(
+                format!(" {}", preset.ctx_size),
+                Style::default().fg(tc.muted),
+            ),
+        ]),
     ];
 
     let mut extras = Vec::new();
@@ -672,7 +687,11 @@ fn draw_confirm_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
         )]));
     } else {
         lines.push(Line::from(vec![Span::styled(
-            "  h/l:backend │ p:port │ Enter:serve │ Esc:cancel",
+            "  h/l:backend │ p:port | space: context",
+            Style::default().fg(tc.warning),
+        )]));
+        lines.push(Line::from(vec![Span::styled(
+            "  Enter:serve │ Esc:cancel",
             Style::default().fg(tc.warning),
         )]));
     }

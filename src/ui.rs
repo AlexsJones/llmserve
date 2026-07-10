@@ -4,7 +4,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table};
 
-use crate::app::{App, Focus, InputMode};
+use crate::app::{App, CONFIRM_FIELDS, ConfirmField, Focus, InputMode};
 use crate::theme::ThemeColors;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -52,6 +52,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         InputMode::ConfirmServe => draw_confirm_popup(frame, app, &tc),
         InputMode::StopPopup => draw_stop_popup(frame, app, &tc),
         InputMode::AddDir => draw_add_dir_popup(frame, app, &tc),
+        InputMode::ServerExit => draw_server_exit_popup(frame, app, &tc),
         _ => {}
     }
 }
@@ -473,11 +474,16 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         InputMode::ConfirmServe => "CONFIRM",
         InputMode::StopPopup => "STOP",
         InputMode::AddDir => "ADD DIR",
+        InputMode::ServerExit => "EXITED",
     };
 
     let help = match app.input_mode {
         InputMode::Search => "type to filter │ Enter:confirm │ Esc:clear",
         InputMode::StopPopup => "j/k:select │ Enter:stop │ Esc:cancel",
+        InputMode::ServerExit => "j/k:scroll │ Enter/Esc:dismiss",
+        InputMode::ConfirmServe => {
+            "j/k:field │ h/l/Space:change │ e:edit │ s:save default │ Enter:serve │ Esc:cancel"
+        }
         InputMode::AddDir => "type path │ Tab:complete │ Enter:add │ Esc:cancel",
         InputMode::Normal if app.focus == Focus::Tree => {
             "j/k:nav │ Enter:filter │ Space:expand │ a:add │ x:rm │ S+←→:resize │ Tab:next │ q:quit"
@@ -557,137 +563,142 @@ fn draw_backend_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 }
 
 fn draw_confirm_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
-    let area = centered_rect(58, 14, frame.area());
+    let area = centered_rect(62, 17, frame.area());
     frame.render_widget(Clear, area);
 
     let block = Block::default()
-        .title(" Confirm Serve ")
+        .title(" Serve Model ")
         .title_style(Style::default().fg(tc.title).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tc.accent))
         .style(Style::default().bg(tc.bg));
 
+    let inner_width = block.inner(area).width as usize;
     let model_name = app.selected_model().map(|m| m.name.as_str()).unwrap_or("?");
 
     let backend = app.confirm_backend();
     let backend_label = backend.map(|b| b.backend.label()).unwrap_or("?");
     let backend_available = backend.is_some_and(|b| b.available);
-    let backend_key_str = backend
-        .map(|b| crate::backends::backend_key(&b.backend))
-        .unwrap_or("unknown");
 
-    let preset = app.config.preset_for(backend_key_str);
-    let already_serving = app.confirm_already_serving();
-
-    let compatible = app.confirm_compatible();
-    let incompatible_reason = app.confirm_incompatible_reason();
-
-    let backend_status = if !compatible {
-        let reason = incompatible_reason.unwrap_or("incompatible");
+    let backend_status = if !app.confirm_compatible() {
+        let reason = app.confirm_incompatible_reason().unwrap_or("incompatible");
         Span::styled(format!(" [{reason}]"), Style::default().fg(tc.error))
     } else if !backend_available {
         Span::styled(" [not found]", Style::default().fg(tc.error))
-    } else if already_serving {
+    } else if app.confirm_already_serving() {
         Span::styled(" [already serving]", Style::default().fg(tc.warning))
     } else {
         Span::styled(" [ready]", Style::default().fg(tc.good))
     };
 
-    let port_display = if app.confirm_editing_port {
-        format!("{}_", app.confirm_port_input)
-    } else {
-        app.confirm_port_input.clone()
-    };
-    let port_style = if app.confirm_editing_port {
-        Style::default()
-            .fg(tc.fg)
-            .add_modifier(Modifier::UNDERLINED)
-    } else {
-        Style::default().fg(tc.accent)
-    };
-
-    let use_ctx_size_style = if preset.use_ctx_size {
-        Style::default().fg(tc.accent)
-    } else {
-        Style::default().fg(tc.muted)
-    };
+    let preset = &app.confirm_preset;
+    let selected = app.confirm_selected_field();
 
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Model:   ", Style::default().fg(tc.muted)),
+            Span::styled("    Model:      ", Style::default().fg(tc.muted)),
             Span::styled(model_name, Style::default().fg(tc.fg)),
         ]),
-        Line::from(vec![
-            Span::styled("  Backend: ", Style::default().fg(tc.muted)),
-            Span::styled(
-                format!("< {backend_label} >"),
-                Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
-            ),
-            backend_status,
-        ]),
-        Line::from(vec![
-            Span::styled("  Port:    ", Style::default().fg(tc.muted)),
-            Span::styled(&port_display, port_style),
-            Span::styled(
-                if app.confirm_editing_port {
-                    "  (type digits, Tab to exit)"
-                } else {
-                    "  (p/Tab to edit)"
-                },
-                Style::default().fg(tc.muted),
-            ),
-        ]),
-        Line::from(vec![Span::styled(
-            format!("  Flash: {}", if preset.flash_attn { "on" } else { "off" }),
-            Style::default().fg(tc.muted),
-        )]),
-        Line::from(vec![
-            Span::styled("  Context: ", Style::default().fg(tc.muted)),
-            Span::styled("[", Style::default().fg(tc.muted)),
-            Span::styled(
-                format!("{}", if preset.use_ctx_size { "V" } else { " " },),
-                use_ctx_size_style,
-            ),
-            Span::styled("]", Style::default().fg(tc.muted)),
-            Span::styled(
-                format!(" {}", preset.ctx_size),
-                Style::default().fg(tc.muted),
-            ),
-        ]),
+        Line::from(""),
     ];
 
-    let mut extras = Vec::new();
-    if let Some(bs) = preset.batch_size {
-        extras.push(format!("batch:{bs}"));
-    }
-    if let Some(gl) = preset.gpu_layers {
-        extras.push(format!("gpu-layers:{gl}"));
-    }
-    if let Some(t) = preset.threads {
-        extras.push(format!("threads:{t}"));
-    }
-    if !preset.extra_args.is_empty() {
-        extras.push(preset.extra_args.join(" "));
-    }
-    if !extras.is_empty() {
-        lines.push(Line::from(vec![Span::styled(
-            format!("  Args:    {}", extras.join(" │ ")),
-            Style::default().fg(tc.muted),
-        )]));
+    let auto = |v: Option<String>| v.unwrap_or_else(|| "auto".into());
+
+    for field in CONFIRM_FIELDS {
+        let is_sel = field == selected;
+        let editing = is_sel && app.confirm_editing;
+
+        let (label, mut value, hint) = match field {
+            ConfirmField::Backend => (
+                "Backend",
+                format!("< {backend_label} >"),
+                String::new(), // status span appended below
+            ),
+            ConfirmField::Port => ("Port", app.confirm_port_input.clone(), String::new()),
+            ConfirmField::CtxSize => (
+                "Context",
+                format!(
+                    "[{}] {}",
+                    if preset.use_ctx_size { "x" } else { " " },
+                    preset.ctx_size
+                ),
+                "(Space toggles)".into(),
+            ),
+            ConfirmField::FlashAttn => (
+                "Flash attn",
+                if preset.flash_attn { "on" } else { "off" }.into(),
+                String::new(),
+            ),
+            ConfirmField::GpuLayers => (
+                "GPU layers",
+                auto(preset.gpu_layers.map(|v| v.to_string())),
+                String::new(),
+            ),
+            ConfirmField::Threads => (
+                "Threads",
+                auto(preset.threads.map(|v| v.to_string())),
+                String::new(),
+            ),
+            ConfirmField::BatchSize => (
+                "Batch",
+                auto(preset.batch_size.map(|v| v.to_string())),
+                String::new(),
+            ),
+            ConfirmField::ExtraArgs => (
+                "Extra args",
+                if preset.extra_args.is_empty() {
+                    "(none)".into()
+                } else {
+                    preset.extra_args.join(" ")
+                },
+                String::new(),
+            ),
+        };
+
+        if editing {
+            value = format!("{}_", app.confirm_edit_buf);
+        }
+        let max_val = inner_width.saturating_sub(18 + hint.len());
+        let value: String = value.chars().take(max_val).collect();
+
+        let marker = if is_sel { "  > " } else { "    " };
+        let value_style = if editing {
+            Style::default()
+                .fg(tc.fg)
+                .add_modifier(Modifier::UNDERLINED)
+        } else if is_sel {
+            Style::default().fg(tc.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(tc.fg)
+        };
+
+        let mut spans = vec![
+            Span::styled(marker, Style::default().fg(tc.accent)),
+            Span::styled(format!("{label:<12}"), Style::default().fg(tc.muted)),
+            Span::styled(value, value_style),
+        ];
+        if field == ConfirmField::Backend {
+            spans.push(backend_status.clone());
+        } else if is_sel && !hint.is_empty() {
+            spans.push(Span::styled(
+                format!("  {hint}"),
+                Style::default().fg(tc.muted),
+            ));
+        }
+        lines.push(Line::from(spans));
     }
 
     lines.push(Line::from(""));
-
-    if app.confirm_editing_port {
+    if app.confirm_editing {
         lines.push(Line::from(vec![Span::styled(
-            "  Tab:done │ Esc:cancel edit",
+            "  Enter:done │ Esc:cancel edit  (empty = auto)",
             Style::default().fg(tc.warning),
         )]));
     } else {
         lines.push(Line::from(vec![Span::styled(
-            "  h/l:backend │ p:port | space: context",
+            "  j/k:field │ h/l/Space:change │ e:edit │ s:save default",
             Style::default().fg(tc.warning),
         )]));
         lines.push(Line::from(vec![Span::styled(
@@ -819,6 +830,93 @@ fn draw_add_dir_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
         "  Tab:complete │ Enter:add │ Esc:cancel",
         Style::default().fg(tc.warning),
     )]));
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_server_exit_popup(frame: &mut Frame, app: &mut App, tc: &ThemeColors) {
+    let Some(info) = app.current_exit_popup() else {
+        return;
+    };
+
+    let frame_area = frame.area();
+    let width = frame_area.width.saturating_sub(8).clamp(40, 80);
+    // 4 header lines + 2 borders, plus the log tail
+    let wanted = info.log_lines.len().max(1) as u16 + 6;
+    let height = wanted.min(frame_area.height.saturating_sub(4)).max(8);
+    let area = centered_rect(width, height, frame_area);
+    frame.render_widget(Clear, area);
+
+    let title = if app.exit_popups.len() > 1 {
+        format!(" Server Exited (1 of {}) ", app.exit_popups.len())
+    } else {
+        " Server Exited ".to_string()
+    };
+
+    let block = Block::default()
+        .title(title)
+        .title_style(Style::default().fg(tc.error).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tc.error))
+        .title_bottom(
+            Line::from(" j/k:scroll │ Enter/Esc:dismiss ")
+                .right_aligned()
+                .style(Style::default().fg(tc.muted)),
+        )
+        .style(Style::default().bg(tc.bg));
+
+    let inner = block.inner(area);
+    let inner_width = inner.width as usize;
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("  Model:   ", Style::default().fg(tc.muted)),
+            Span::styled(
+                info.model_name.clone(),
+                Style::default().fg(tc.fg).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Backend: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                format!("{} (port {})", info.backend_label, info.port),
+                Style::default().fg(tc.accent),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Status:  ", Style::default().fg(tc.muted)),
+            Span::styled(info.message.clone(), Style::default().fg(tc.error)),
+        ]),
+        Line::from(vec![Span::styled(
+            "  ── last output ──",
+            Style::default().fg(tc.muted),
+        )]),
+    ];
+
+    // Log tail fills the remaining height; scroll offset counts up from the bottom
+    let log_visible = (inner.height as usize).saturating_sub(lines.len());
+    let max_scroll = info.log_lines.len().saturating_sub(log_visible);
+    let scroll = app.exit_popup_scroll.min(max_scroll);
+    let skip = info.log_lines.len().saturating_sub(log_visible + scroll);
+
+    if info.log_lines.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "  (no output captured)",
+            Style::default().fg(tc.muted),
+        )]));
+    } else {
+        for text in info.log_lines.iter().skip(skip).take(log_visible) {
+            let style = log_line_style(text, tc);
+            let truncated: String = text.chars().take(inner_width.saturating_sub(2)).collect();
+            lines.push(Line::from(vec![Span::styled(
+                format!("  {truncated}"),
+                style,
+            )]));
+        }
+    }
+
+    app.exit_popup_scroll = scroll;
 
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }

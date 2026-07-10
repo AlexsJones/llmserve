@@ -2,7 +2,7 @@ use crate::backends::{
     Backend, DetectedBackend, detect_backends, fetch_fastflowlm_models, fetch_lemonade_models,
     fetch_lmstudio_models, fetch_ollama_models,
 };
-use crate::config::Config;
+use crate::config::{Config, ResolvedPreset};
 use crate::models::{
     DiscoveredModel, ModelFormat, ModelSource, add_fastflowlm_models, add_lemonade_models,
     add_lmstudio_models, add_ollama_models, discover_models,
@@ -20,6 +20,41 @@ pub enum InputMode {
     ConfirmServe,
     StopPopup,
     AddDir,
+    ServerExit,
+}
+
+/// Editable fields in the confirm-serve modal, in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmField {
+    Backend,
+    Port,
+    CtxSize,
+    FlashAttn,
+    GpuLayers,
+    Threads,
+    BatchSize,
+    ExtraArgs,
+}
+
+pub const CONFIRM_FIELDS: [ConfirmField; 8] = [
+    ConfirmField::Backend,
+    ConfirmField::Port,
+    ConfirmField::CtxSize,
+    ConfirmField::FlashAttn,
+    ConfirmField::GpuLayers,
+    ConfirmField::Threads,
+    ConfirmField::BatchSize,
+    ConfirmField::ExtraArgs,
+];
+
+/// Details about a server that exited on its own, shown in a popup modal.
+#[derive(Debug, Clone)]
+pub struct ExitInfo {
+    pub model_name: String,
+    pub backend_label: String,
+    pub port: u16,
+    pub message: String,
+    pub log_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,10 +152,20 @@ pub struct App {
     pub stop_popup_cursor: usize,
     /// Log lines from servers that have exited (so we can see crash output).
     pub dead_logs: VecDeque<String>,
+    /// Queue of unexpected server exits awaiting acknowledgement via popup.
+    pub exit_popups: VecDeque<ExitInfo>,
+    /// Scroll offset (lines up from the bottom) within the exit popup log view.
+    pub exit_popup_scroll: usize,
 
     pub confirm_backend_idx: usize,
     pub confirm_port_input: String,
-    pub confirm_editing_port: bool,
+    /// Working copy of the launch settings, seeded from the backend's preset.
+    pub confirm_preset: ResolvedPreset,
+    /// Index into CONFIRM_FIELDS of the selected field.
+    pub confirm_field: usize,
+    /// Whether the selected field is being text-edited.
+    pub confirm_editing: bool,
+    pub confirm_edit_buf: String,
 
     // Source tree
     pub tree_nodes: Vec<TreeNode>,
@@ -227,9 +272,14 @@ impl App {
             servers: Vec::new(),
             stop_popup_cursor: 0,
             dead_logs: VecDeque::new(),
+            exit_popups: VecDeque::new(),
+            exit_popup_scroll: 0,
             confirm_backend_idx: selected_backend,
             confirm_port_input: String::new(),
-            confirm_editing_port: false,
+            confirm_preset: config.preset_for("llama-server"),
+            confirm_field: 0,
+            confirm_editing: false,
+            confirm_edit_buf: String::new(),
             tree_nodes,
             tree_cursor: 0,
             tree_source_filter: None,
@@ -701,8 +751,19 @@ impl App {
 
         self.confirm_backend_idx = best;
         self.confirm_port_input = self.next_available_port().to_string();
-        self.confirm_editing_port = false;
+        self.confirm_field = 0;
+        self.confirm_editing = false;
+        self.confirm_edit_buf.clear();
+        self.confirm_reseed_preset();
         self.input_mode = InputMode::ConfirmServe;
+    }
+
+    /// Re-seed the working preset from the currently selected backend's config.
+    fn confirm_reseed_preset(&mut self) {
+        if let Some(b) = self.backends.get(self.confirm_backend_idx) {
+            let key = crate::backends::backend_key(&b.backend);
+            self.confirm_preset = self.config.preset_for(key);
+        }
     }
 
     pub fn confirm_backend(&self) -> Option<&DetectedBackend> {
@@ -747,6 +808,7 @@ impl App {
     pub fn confirm_cycle_backend_right(&mut self) {
         if !self.backends.is_empty() {
             self.confirm_backend_idx = (self.confirm_backend_idx + 1) % self.backends.len();
+            self.confirm_reseed_preset();
         }
     }
 
@@ -757,25 +819,155 @@ impl App {
             } else {
                 self.confirm_backend_idx - 1
             };
+            self.confirm_reseed_preset();
         }
     }
 
-    pub fn confirm_toggle_port_edit(&mut self) {
-        self.confirm_editing_port = !self.confirm_editing_port;
+    pub fn confirm_selected_field(&self) -> ConfirmField {
+        CONFIRM_FIELDS[self.confirm_field.min(CONFIRM_FIELDS.len() - 1)]
     }
 
-    pub fn toggle_use_ctx_size(&mut self) {
-        self.config.use_ctx_size = !self.config.use_ctx_size;
+    pub fn confirm_field_down(&mut self) {
+        self.confirm_field = (self.confirm_field + 1) % CONFIRM_FIELDS.len();
     }
 
-    pub fn confirm_port_push(&mut self, c: char) {
-        if c.is_ascii_digit() && self.confirm_port_input.len() < 5 {
-            self.confirm_port_input.push(c);
+    pub fn confirm_field_up(&mut self) {
+        self.confirm_field = if self.confirm_field == 0 {
+            CONFIRM_FIELDS.len() - 1
+        } else {
+            self.confirm_field - 1
+        };
+    }
+
+    /// h/l or Space on the selected field: cycle backend or flip a toggle.
+    pub fn confirm_field_left(&mut self) {
+        match self.confirm_selected_field() {
+            ConfirmField::Backend => self.confirm_cycle_backend_left(),
+            _ => self.confirm_toggle(),
         }
     }
 
-    pub fn confirm_port_pop(&mut self) {
-        self.confirm_port_input.pop();
+    pub fn confirm_field_right(&mut self) {
+        match self.confirm_selected_field() {
+            ConfirmField::Backend => self.confirm_cycle_backend_right(),
+            _ => self.confirm_toggle(),
+        }
+    }
+
+    pub fn confirm_toggle(&mut self) {
+        match self.confirm_selected_field() {
+            ConfirmField::CtxSize => {
+                self.confirm_preset.use_ctx_size = !self.confirm_preset.use_ctx_size;
+            }
+            ConfirmField::FlashAttn => {
+                self.confirm_preset.flash_attn = !self.confirm_preset.flash_attn;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn confirm_begin_edit(&mut self) {
+        let buf = match self.confirm_selected_field() {
+            // Not text-editable
+            ConfirmField::Backend | ConfirmField::FlashAttn => return,
+            ConfirmField::Port => self.confirm_port_input.clone(),
+            ConfirmField::CtxSize => self.confirm_preset.ctx_size.to_string(),
+            ConfirmField::GpuLayers => self
+                .confirm_preset
+                .gpu_layers
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            ConfirmField::Threads => self
+                .confirm_preset
+                .threads
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            ConfirmField::BatchSize => self
+                .confirm_preset
+                .batch_size
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            ConfirmField::ExtraArgs => self.confirm_preset.extra_args.join(" "),
+        };
+        self.confirm_edit_buf = buf;
+        self.confirm_editing = true;
+    }
+
+    pub fn confirm_edit_push(&mut self, c: char) {
+        let ok = match self.confirm_selected_field() {
+            ConfirmField::Port => c.is_ascii_digit() && self.confirm_edit_buf.len() < 5,
+            ConfirmField::CtxSize | ConfirmField::Threads | ConfirmField::BatchSize => {
+                c.is_ascii_digit() && self.confirm_edit_buf.len() < 9
+            }
+            ConfirmField::GpuLayers => {
+                (c.is_ascii_digit() || (c == '-' && self.confirm_edit_buf.is_empty()))
+                    && self.confirm_edit_buf.len() < 5
+            }
+            ConfirmField::ExtraArgs => !c.is_control(),
+            ConfirmField::Backend | ConfirmField::FlashAttn => false,
+        };
+        if ok {
+            self.confirm_edit_buf.push(c);
+        }
+    }
+
+    pub fn confirm_edit_pop(&mut self) {
+        self.confirm_edit_buf.pop();
+    }
+
+    /// Commit the edit buffer into the working preset. Empty optional fields
+    /// become "auto" (None); unparseable input keeps the previous value.
+    pub fn confirm_commit_edit(&mut self) {
+        let buf = self.confirm_edit_buf.trim().to_string();
+        match self.confirm_selected_field() {
+            ConfirmField::Port => {
+                if buf.parse::<u16>().is_ok() {
+                    self.confirm_port_input = buf;
+                }
+            }
+            ConfirmField::CtxSize => {
+                if let Ok(v) = buf.parse() {
+                    self.confirm_preset.ctx_size = v;
+                }
+            }
+            ConfirmField::GpuLayers => self.confirm_preset.gpu_layers = buf.parse().ok(),
+            ConfirmField::Threads => self.confirm_preset.threads = buf.parse().ok(),
+            ConfirmField::BatchSize => self.confirm_preset.batch_size = buf.parse().ok(),
+            ConfirmField::ExtraArgs => {
+                self.confirm_preset.extra_args =
+                    buf.split_whitespace().map(str::to_string).collect();
+            }
+            ConfirmField::Backend | ConfirmField::FlashAttn => {}
+        }
+        self.confirm_editing = false;
+        self.confirm_edit_buf.clear();
+    }
+
+    pub fn confirm_cancel_edit(&mut self) {
+        self.confirm_editing = false;
+        self.confirm_edit_buf.clear();
+    }
+
+    /// Persist the working preset as this backend's defaults in config.toml.
+    pub fn confirm_save_preset(&mut self) {
+        let Some(backend) = self.backends.get(self.confirm_backend_idx) else {
+            return;
+        };
+        let key = crate::backends::backend_key(&backend.backend).to_string();
+        let p = &self.confirm_preset;
+        let entry = self.config.presets.entry(key.clone()).or_default();
+        entry.ctx_size = Some(p.ctx_size);
+        entry.use_ctx_size = Some(p.use_ctx_size);
+        entry.flash_attn = Some(p.flash_attn);
+        entry.batch_size = p.batch_size;
+        entry.gpu_layers = p.gpu_layers;
+        entry.threads = p.threads;
+        entry.extra_args = p.extra_args.clone();
+        if let Ok(port) = self.confirm_port_input.parse::<u16>() {
+            entry.port = Some(port);
+        }
+        self.config.save();
+        self.status_message = Some(format!("Saved defaults for {key}"));
     }
 
     pub fn do_serve(&mut self) {
@@ -818,7 +1010,10 @@ impl App {
             return;
         }
 
-        match server::launch_on_port(&model, &backend.backend, &self.config, port) {
+        let mut preset = self.confirm_preset.clone();
+        preset.port = port;
+
+        match server::launch_with(&model, &backend.backend, &preset) {
             Ok(handle) => {
                 self.status_message = Some(format!(
                     "Started {} via {} on port {}",
@@ -912,6 +1107,14 @@ impl App {
         }
         for (i, msg) in exited.into_iter().rev() {
             let handle = self.servers.remove(i);
+            // Queue a popup so the user sees why the server exited
+            self.exit_popups.push_back(ExitInfo {
+                model_name: handle.model_name.clone(),
+                backend_label: handle.backend.label().to_string(),
+                port: handle.port,
+                message: msg.clone(),
+                log_lines: handle.log_lines.iter().cloned().collect(),
+            });
             // Preserve logs from the dead server
             self.dead_logs.push_back(format!(
                 "--- {} (:{}) exited: {msg} ---",
@@ -928,7 +1131,43 @@ impl App {
                 "{} (port {}): {msg}",
                 handle.model_name, handle.port
             ));
+            self.show_serve = true; // make crash logs visible after dismissal
         }
+
+        // Surface the popup once no other modal is active
+        if !self.exit_popups.is_empty() && self.input_mode == InputMode::Normal {
+            self.exit_popup_scroll = 0;
+            self.input_mode = InputMode::ServerExit;
+        }
+    }
+
+    // -- Server exit popup --
+
+    pub fn current_exit_popup(&self) -> Option<&ExitInfo> {
+        self.exit_popups.front()
+    }
+
+    pub fn dismiss_exit_popup(&mut self) {
+        self.exit_popups.pop_front();
+        self.exit_popup_scroll = 0;
+        if self.exit_popups.is_empty() {
+            self.input_mode = InputMode::Normal;
+        }
+    }
+
+    pub fn exit_popup_scroll_up(&mut self) {
+        let max = self
+            .exit_popups
+            .front()
+            .map(|e| e.log_lines.len())
+            .unwrap_or(0);
+        if self.exit_popup_scroll < max {
+            self.exit_popup_scroll += 1;
+        }
+    }
+
+    pub fn exit_popup_scroll_down(&mut self) {
+        self.exit_popup_scroll = self.exit_popup_scroll.saturating_sub(1);
     }
 
     /// Get all log lines to display — combines live server logs and dead logs.

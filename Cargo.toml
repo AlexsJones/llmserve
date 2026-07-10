@@ -1,6 +1,6 @@
 [package]
 name = "llmserve"
-version = "0.0.8"
+version = "0.0.9"
 edition = "2024"
 authors = ["Alex Jones"]
 description = "TUI for serving local LLM models. Pick a model, pick a backend, serve it."

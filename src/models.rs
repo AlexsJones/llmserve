@@ -201,6 +201,11 @@ fn scan_gguf_dir(
             };
             let param_source = if parent == dir { &file_stem } else { &dir_name };
 
+            // Prefer the filename hint (free); fall back to the GGUF header's
+            // size label for files with uninformative names.
+            let param_hint = parse_params(param_source)
+                .or_else(|| read_gguf_meta(path).and_then(|m| m.size_label));
+
             models.push(DiscoveredModel {
                 name,
                 path: path.to_path_buf(),
@@ -208,7 +213,7 @@ fn scan_gguf_dir(
                 format: ModelFormat::Gguf,
                 size_bytes,
                 quant: parse_quant(&fname),
-                param_hint: parse_params(param_source),
+                param_hint,
                 source: source.clone(),
             });
         }
@@ -404,6 +409,185 @@ pub fn add_ollama_models(models: &mut Vec<DiscoveredModel>, ollama_models: Vec<(
         });
     }
     models.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+}
+
+// -- GGUF header parsing --
+//
+// Just enough of the GGUF format to pull display metadata out of the header:
+// magic, version, counts, then key/value pairs. Values we don't care about
+// (including the huge tokenizer arrays) are skipped by seeking, so this reads
+// a few KB regardless of model size.
+
+/// Metadata extracted from a GGUF file header.
+#[derive(Debug, Clone, Default)]
+pub struct GgufMeta {
+    pub architecture: Option<String>,
+    pub context_length: Option<u64>,
+    /// Parameter-count label as written by the converter, e.g. "4B", "8x7B".
+    pub size_label: Option<String>,
+}
+
+pub fn read_gguf_meta(path: &Path) -> Option<GgufMeta> {
+    use std::io::BufReader;
+    let file = fs::File::open(path).ok()?;
+    let mut r = BufReader::new(file);
+
+    let mut magic = [0u8; 4];
+    std::io::Read::read_exact(&mut r, &mut magic).ok()?;
+    if &magic != b"GGUF" {
+        return None;
+    }
+    let version = read_u32(&mut r)?;
+    if !(1..=3).contains(&version) {
+        return None;
+    }
+    let _tensor_count = read_u64(&mut r)?;
+    let kv_count = read_u64(&mut r)?;
+
+    let mut meta = GgufMeta::default();
+
+    // Cap iterations defensively against corrupt headers.
+    for _ in 0..kv_count.min(1024) {
+        let Some(key) = read_gguf_string(&mut r, 1024) else {
+            return Some(meta); // corrupt or oversized key — keep what we have
+        };
+        let vtype = read_u32(&mut r)?;
+
+        // Every arm consumes the value (reading it or seeking past it).
+        match key.as_str() {
+            "general.architecture" if vtype == GGUF_TYPE_STRING => {
+                meta.architecture = read_gguf_string(&mut r, 256);
+            }
+            "general.size_label" if vtype == GGUF_TYPE_STRING => {
+                meta.size_label = read_gguf_string(&mut r, 64);
+            }
+            k if k.ends_with(".context_length") => {
+                if let Some(v) = read_gguf_uint(&mut r, vtype) {
+                    meta.context_length = Some(v);
+                }
+            }
+            _ => skip_gguf_value(&mut r, vtype)?,
+        }
+
+        if meta.architecture.is_some() && meta.context_length.is_some() && meta.size_label.is_some()
+        {
+            break;
+        }
+    }
+    Some(meta)
+}
+
+const GGUF_TYPE_STRING: u32 = 8;
+const GGUF_TYPE_ARRAY: u32 = 9;
+
+fn read_u32(r: &mut impl std::io::Read) -> Option<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b).ok()?;
+    Some(u32::from_le_bytes(b))
+}
+
+fn read_u64(r: &mut impl std::io::Read) -> Option<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b).ok()?;
+    Some(u64::from_le_bytes(b))
+}
+
+fn skip_bytes<R: std::io::Read + std::io::Seek>(
+    r: &mut std::io::BufReader<R>,
+    n: u64,
+) -> Option<()> {
+    let n: i64 = n.try_into().ok()?;
+    r.seek_relative(n).ok()
+}
+
+/// Read a length-prefixed GGUF string, or skip it (returning None) if it
+/// exceeds `cap` bytes.
+fn read_gguf_string<R: std::io::Read + std::io::Seek>(
+    r: &mut std::io::BufReader<R>,
+    cap: u64,
+) -> Option<String> {
+    let len = read_u64(r)?;
+    if len > cap {
+        skip_bytes(r, len)?;
+        return None;
+    }
+    let mut buf = vec![0u8; len as usize];
+    std::io::Read::read_exact(r, &mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Read an unsigned integer value of the given GGUF type; skips the value and
+/// returns None for non-integer types.
+fn read_gguf_uint<R: std::io::Read + std::io::Seek>(
+    r: &mut std::io::BufReader<R>,
+    vtype: u32,
+) -> Option<u64> {
+    match vtype {
+        0 => {
+            // u8
+            let mut b = [0u8; 1];
+            std::io::Read::read_exact(r, &mut b).ok()?;
+            Some(b[0] as u64)
+        }
+        2 => {
+            // u16
+            let mut b = [0u8; 2];
+            std::io::Read::read_exact(r, &mut b).ok()?;
+            Some(u16::from_le_bytes(b) as u64)
+        }
+        4 => read_u32(r).map(u64::from),
+        10 => read_u64(r),
+        5 => {
+            // i32 — context lengths are sometimes written signed
+            read_u32(r)
+                .map(|v| v as i32)
+                .filter(|v| *v >= 0)
+                .map(|v| v as u64)
+        }
+        11 => read_u64(r)
+            .map(|v| v as i64)
+            .filter(|v| *v >= 0)
+            .map(|v| v as u64),
+        _ => {
+            skip_gguf_value(r, vtype)?;
+            None
+        }
+    }
+}
+
+fn skip_gguf_value<R: std::io::Read + std::io::Seek>(
+    r: &mut std::io::BufReader<R>,
+    vtype: u32,
+) -> Option<()> {
+    match vtype {
+        0 | 1 | 7 => skip_bytes(r, 1),
+        2 | 3 => skip_bytes(r, 2),
+        4 | 5 | 6 => skip_bytes(r, 4),
+        10 | 11 | 12 => skip_bytes(r, 8),
+        GGUF_TYPE_STRING => {
+            let len = read_u64(r)?;
+            skip_bytes(r, len)
+        }
+        GGUF_TYPE_ARRAY => {
+            let elem = read_u32(r)?;
+            let count = read_u64(r)?;
+            match elem {
+                0 | 1 | 7 => skip_bytes(r, count),
+                2 | 3 => skip_bytes(r, count.checked_mul(2)?),
+                4 | 5 | 6 => skip_bytes(r, count.checked_mul(4)?),
+                10 | 11 | 12 => skip_bytes(r, count.checked_mul(8)?),
+                GGUF_TYPE_STRING => {
+                    for _ in 0..count {
+                        let len = read_u64(r)?;
+                        skip_bytes(r, len)?;
+                    }
+                    Some(())
+                }
+                _ => None, // nested arrays are not produced by converters
+            }
+        }
+        _ => None,
+    }
 }
 
 fn find_mmproj(dir: &Path) -> Option<PathBuf> {
@@ -637,6 +821,74 @@ mod tests {
         assert_eq!(names.len(), 2, "names should be distinct, got: {names:?}");
 
         fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// Build a minimal synthetic GGUF header for parser tests.
+    fn synth_gguf(kvs: &[(&str, u32, Vec<u8>)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend(b"GGUF");
+        b.extend(3u32.to_le_bytes()); // version
+        b.extend(0u64.to_le_bytes()); // tensor count
+        b.extend((kvs.len() as u64).to_le_bytes());
+        for (key, vtype, value) in kvs {
+            b.extend((key.len() as u64).to_le_bytes());
+            b.extend(key.as_bytes());
+            b.extend(vtype.to_le_bytes());
+            b.extend(value);
+        }
+        b
+    }
+
+    fn gguf_string(s: &str) -> Vec<u8> {
+        let mut v = (s.len() as u64).to_le_bytes().to_vec();
+        v.extend(s.as_bytes());
+        v
+    }
+
+    #[test]
+    fn read_gguf_meta_extracts_fields() {
+        // Include a string array (like a tokenizer vocab) to prove skipping works
+        let mut vocab = Vec::new();
+        vocab.extend(8u32.to_le_bytes()); // elem type: string
+        vocab.extend(3u64.to_le_bytes()); // count
+        for word in ["alpha", "beta", "gamma"] {
+            vocab.extend(gguf_string(word));
+        }
+
+        let bytes = synth_gguf(&[
+            ("general.architecture", 8, gguf_string("gemma3")),
+            ("tokenizer.ggml.tokens", 9, vocab),
+            ("gemma3.context_length", 4, 131072u32.to_le_bytes().to_vec()),
+            ("general.size_label", 8, gguf_string("4B")),
+        ]);
+
+        let tmp = std::env::temp_dir().join(format!("llmserve_gguf_{}.gguf", std::process::id()));
+        fs::write(&tmp, bytes).unwrap();
+        let meta = read_gguf_meta(&tmp).expect("should parse");
+        fs::remove_file(&tmp).unwrap();
+
+        assert_eq!(meta.architecture.as_deref(), Some("gemma3"));
+        assert_eq!(meta.context_length, Some(131072));
+        assert_eq!(meta.size_label.as_deref(), Some("4B"));
+    }
+
+    #[test]
+    fn read_gguf_meta_rejects_non_gguf() {
+        let tmp =
+            std::env::temp_dir().join(format!("llmserve_notgguf_{}.gguf", std::process::id()));
+        fs::write(&tmp, b"this is not a gguf file at all").unwrap();
+        assert!(read_gguf_meta(&tmp).is_none());
+        fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn read_gguf_meta_survives_truncated_header() {
+        let bytes = synth_gguf(&[("general.architecture", 8, gguf_string("llama"))]);
+        let tmp = std::env::temp_dir().join(format!("llmserve_trunc_{}.gguf", std::process::id()));
+        // Truncate mid-header: parser should return what it has or None, not panic
+        fs::write(&tmp, &bytes[..bytes.len() / 2]).unwrap();
+        let _ = read_gguf_meta(&tmp);
+        fs::remove_file(&tmp).unwrap();
     }
 
     #[test]

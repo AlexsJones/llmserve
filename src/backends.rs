@@ -88,17 +88,33 @@ fn http_agent() -> ureq::Agent {
 }
 
 pub fn detect_backends() -> Vec<DetectedBackend> {
-    vec![
-        detect_llama_server(),
-        detect_ollama(),
-        detect_mlx(),
-        detect_lmstudio(),
-        detect_vllm(),
-        detect_koboldcpp(),
-        detect_localai(),
-        detect_lemonade(),
-        detect_fastflowlm(),
-    ]
+    // Several detectors make HTTP probes with an 800ms timeout; run them all
+    // concurrently so detection costs one probe's latency, not the sum.
+    let detectors: [(Backend, fn() -> DetectedBackend); 9] = [
+        (Backend::LlamaServer, detect_llama_server),
+        (Backend::Ollama, detect_ollama),
+        (Backend::MlxLm, detect_mlx),
+        (Backend::LmStudio, detect_lmstudio),
+        (Backend::Vllm, detect_vllm),
+        (Backend::KoboldCpp, detect_koboldcpp),
+        (Backend::LocalAi, detect_localai),
+        (Backend::Lemonade, detect_lemonade),
+        (Backend::FastFlowLm, detect_fastflowlm),
+    ];
+    std::thread::scope(|s| {
+        detectors
+            .map(|(backend, f)| (backend, s.spawn(f)))
+            .map(|(backend, h)| {
+                h.join().unwrap_or(DetectedBackend {
+                    backend,
+                    available: false,
+                    binary_path: None,
+                    api_url: None,
+                })
+            })
+            .into_iter()
+            .collect()
+    })
 }
 
 /// Cross-platform binary lookup. Uses `which` on Unix and `where` on Windows.
@@ -221,10 +237,10 @@ fn detect_lmstudio() -> DetectedBackend {
     }
 }
 
-/// Returns LM Studio model list from API: Vec<(id, size_bytes)>
-/// LM Studio exposes an OpenAI-compatible /v1/models endpoint.
-pub fn fetch_lmstudio_models(api_url: &str) -> Vec<(String, u64)> {
-    let url = format!("{api_url}/v1/models");
+/// Fetch the model list from an OpenAI-compatible `models` endpoint:
+/// returns Vec<(id, size_bytes)> (size is not exposed by these APIs).
+fn fetch_openai_models(api_url: &str, path: &str) -> Vec<(String, u64)> {
+    let url = format!("{api_url}{path}");
     let agent = http_agent();
     let Ok(mut response) = agent.get(&url).call() else {
         return Vec::new();
@@ -244,6 +260,11 @@ pub fn fetch_lmstudio_models(api_url: &str) -> Vec<(String, u64)> {
             Some((id, 0u64))
         })
         .collect()
+}
+
+/// Returns LM Studio model list from its OpenAI-compatible /v1/models endpoint.
+pub fn fetch_lmstudio_models(api_url: &str) -> Vec<(String, u64)> {
+    fetch_openai_models(api_url, "/v1/models")
 }
 
 fn detect_vllm() -> DetectedBackend {
@@ -295,29 +316,9 @@ fn detect_lemonade() -> DetectedBackend {
     }
 }
 
-/// Returns Lemonade model list from API: Vec<(id, size_bytes)>
-/// Lemonade exposes an OpenAI-compatible /api/v1/models endpoint.
+/// Returns Lemonade model list from its OpenAI-compatible /api/v1/models endpoint.
 pub fn fetch_lemonade_models(api_url: &str) -> Vec<(String, u64)> {
-    let url = format!("{api_url}/api/v1/models");
-    let agent = http_agent();
-    let Ok(mut response) = agent.get(&url).call() else {
-        return Vec::new();
-    };
-    let Ok(body) = response.body_mut().read_to_string() else {
-        return Vec::new();
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
-        return Vec::new();
-    };
-    let Some(data) = json.get("data").and_then(|d| d.as_array()) else {
-        return Vec::new();
-    };
-    data.iter()
-        .filter_map(|m| {
-            let id = m.get("id")?.as_str()?.to_string();
-            Some((id, 0u64))
-        })
-        .collect()
+    fetch_openai_models(api_url, "/api/v1/models")
 }
 
 fn detect_fastflowlm() -> DetectedBackend {
@@ -336,29 +337,9 @@ fn detect_fastflowlm() -> DetectedBackend {
     }
 }
 
-/// Returns FastFlowLM model list from API: Vec<(id, size_bytes)>
-/// FastFlowLM exposes an OpenAI-compatible /v1/models endpoint.
+/// Returns FastFlowLM model list from its OpenAI-compatible /v1/models endpoint.
 pub fn fetch_fastflowlm_models(api_url: &str) -> Vec<(String, u64)> {
-    let url = format!("{api_url}/v1/models");
-    let agent = http_agent();
-    let Ok(mut response) = agent.get(&url).call() else {
-        return Vec::new();
-    };
-    let Ok(body) = response.body_mut().read_to_string() else {
-        return Vec::new();
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
-        return Vec::new();
-    };
-    let Some(data) = json.get("data").and_then(|d| d.as_array()) else {
-        return Vec::new();
-    };
-    data.iter()
-        .filter_map(|m| {
-            let id = m.get("id")?.as_str()?.to_string();
-            Some((id, 0u64))
-        })
-        .collect()
+    fetch_openai_models(api_url, "/v1/models")
 }
 
 fn detect_localai() -> DetectedBackend {

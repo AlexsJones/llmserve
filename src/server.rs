@@ -3,10 +3,21 @@ use crate::config::{Config, ResolvedPreset};
 use crate::models::DiscoveredModel;
 use std::collections::VecDeque;
 use std::io::Read;
+use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
-use std::time::Instant;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-const MAX_LOG_LINES: usize = 200;
+const MAX_LOG_LINES: usize = 1000;
+
+/// A chunk of child output forwarded from a reader thread.
+enum LogMsg {
+    /// A complete, newline-terminated line.
+    Line(String),
+    /// A carriage-return progress update that should replace the previous one.
+    Progress(String),
+}
 
 pub struct ServerHandle {
     pub backend: Backend,
@@ -16,10 +27,18 @@ pub struct ServerHandle {
     pub host: String,
     pub child: Child,
     pub started_at: Instant,
+    /// Whether the server has started accepting TCP connections.
+    pub ready: bool,
+    /// The model and preset used to launch, kept so a crashed server can be
+    /// relaunched with identical settings.
+    pub model: DiscoveredModel,
+    pub preset: ResolvedPreset,
     /// Ring buffer of log lines (combined stdout + stderr).
     pub log_lines: VecDeque<String>,
-    /// Partial line buffer for incomplete reads.
-    partial: String,
+    rx: Receiver<LogMsg>,
+    readers: Vec<JoinHandle<()>>,
+    last_probe: Option<Instant>,
+    last_was_progress: bool,
 }
 
 impl ServerHandle {
@@ -38,123 +57,162 @@ impl ServerHandle {
         format!("http://{}:{}", self.host, self.port)
     }
 
-    /// Read any available output from stderr (non-blocking).
+    /// Pull any output forwarded by the reader threads into the ring buffer.
     pub fn drain_output(&mut self) {
-        let Some(stderr) = self.child.stderr.as_mut() else {
-            return;
-        };
-
-        let mut buf = [0u8; 4096];
-        // Non-blocking read — will return WouldBlock if nothing available
-        loop {
-            match stderr.read(&mut buf) {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    let chunk = String::from_utf8_lossy(&buf[..n]);
-                    self.partial.push_str(&chunk);
-
-                    // Split into complete lines
-                    while let Some(pos) = self.partial.find('\n') {
-                        let line: String = self.partial.drain(..=pos).collect();
-                        let line = line.trim_end_matches('\n').trim_end_matches('\r');
-                        self.log_lines.push_back(line.to_string());
-                        if self.log_lines.len() > MAX_LOG_LINES {
-                            self.log_lines.pop_front();
-                        }
-                    }
-
-                    // Handle \r (carriage return) for progress lines
-                    if self.partial.contains('\r') {
-                        let last = self.partial.rsplit('\r').next().unwrap_or("").to_string();
-                        if !last.is_empty() {
-                            // Replace last line if it was a progress update
-                            if let Some(back) = self.log_lines.back_mut() {
-                                if back.contains('\r') || back.contains('%') || back.contains("...")
-                                {
-                                    *back = last.clone();
-                                } else {
-                                    self.log_lines.push_back(last.clone());
-                                }
-                            } else {
-                                self.log_lines.push_back(last.clone());
-                            }
-                        }
-                        self.partial.clear();
-                        self.partial.push_str(&last);
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
+        while let Ok(msg) = self.rx.try_recv() {
+            self.apply_log(msg);
         }
+    }
 
-        // Also try stdout
-        let Some(stdout) = self.child.stdout.as_mut() else {
-            return;
+    fn apply_log(&mut self, msg: LogMsg) {
+        let (text, is_progress) = match msg {
+            LogMsg::Line(l) => (l, false),
+            LogMsg::Progress(p) => (p, true),
         };
-        loop {
-            match stdout.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let chunk = String::from_utf8_lossy(&buf[..n]);
-                    for line in chunk.lines() {
-                        self.log_lines.push_back(line.to_string());
-                        if self.log_lines.len() > MAX_LOG_LINES {
-                            self.log_lines.pop_front();
-                        }
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
+        // A progress update — or the final line completing one — replaces the
+        // previous progress line instead of appending.
+        if self.last_was_progress {
+            if let Some(back) = self.log_lines.back_mut() {
+                *back = text;
+            } else {
+                self.log_lines.push_back(text);
             }
+        } else {
+            self.log_lines.push_back(text);
+        }
+        self.last_was_progress = is_progress;
+        while self.log_lines.len() > MAX_LOG_LINES {
+            self.log_lines.pop_front();
+        }
+    }
+
+    /// Probe whether the server is ready to answer requests (at most once per
+    /// second, and never again once it succeeds). Uses HTTP /health rather
+    /// than a bare TCP connect: llama-server opens its listener before the
+    /// model finishes loading and answers 503 until it's actually ready.
+    /// Backends without a /health endpoint answer 404, which still proves
+    /// the server is up.
+    pub fn probe_ready(&mut self) {
+        if self.ready {
+            return;
+        }
+        let due = self
+            .last_probe
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+        if !due {
+            return;
+        }
+        self.last_probe = Some(Instant::now());
+        let host = if self.host == "0.0.0.0" {
+            "127.0.0.1"
+        } else {
+            self.host.as_str()
+        };
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_millis(150)))
+            .build()
+            .new_agent();
+        match agent
+            .get(format!("http://{host}:{}/health", self.port))
+            .call()
+        {
+            Ok(_) => self.ready = true,
+            // Any HTTP answer means the server is up; 503 specifically means
+            // "still loading" (llama-server semantics), so keep waiting.
+            Err(ureq::Error::StatusCode(code)) if code != 503 => self.ready = true,
+            Err(_) => {}
+        }
+    }
+
+    /// Wait for the reader threads to finish flushing (call after the child
+    /// has exited or been killed, so they see EOF promptly).
+    fn join_readers(&mut self) {
+        for h in self.readers.drain(..) {
+            let _ = h.join();
         }
     }
 }
 
-fn set_nonblocking(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        if let Some(ref stderr) = child.stderr {
-            let fd = stderr.as_raw_fd();
-            unsafe {
-                let flags = libc::fcntl(fd, libc::F_GETFL);
-                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
-        }
-        if let Some(ref stdout) = child.stdout {
-            let fd = stdout.as_raw_fd();
-            unsafe {
-                let flags = libc::fcntl(fd, libc::F_GETFL);
-                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
-        }
-    }
+/// Read a child pipe on a dedicated thread, forwarding complete lines and
+/// carriage-return progress updates. Blocking reads are fine here — the
+/// thread exits on EOF when the child dies. This is portable (no fcntl),
+/// so serving works on Windows too.
+fn spawn_reader<R: Read + Send + 'static>(mut src: R, tx: Sender<LogMsg>) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut partial = String::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match src.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    partial.push_str(&String::from_utf8_lossy(&buf[..n]));
 
-    // Windows: would need winapi/windows-sys crate for SetNamedPipeHandleState(PIPE_NOWAIT)
-    #[cfg(windows)]
-    let _ = child;
+                    while let Some(pos) = partial.find('\n') {
+                        let line: String = partial.drain(..=pos).collect();
+                        let line = line.trim_end_matches('\n').trim_end_matches('\r');
+                        // Keep only the final segment of any in-line \r updates
+                        let line = line.rsplit('\r').next().unwrap_or(line);
+                        if tx.send(LogMsg::Line(line.to_string())).is_err() {
+                            return;
+                        }
+                    }
+
+                    if partial.contains('\r') {
+                        let last = partial.rsplit('\r').next().unwrap_or("").to_string();
+                        if !last.is_empty() && tx.send(LogMsg::Progress(last.clone())).is_err() {
+                            return;
+                        }
+                        partial.clear();
+                        partial.push_str(&last);
+                    }
+                }
+            }
+        }
+        let rest = partial.trim();
+        if !rest.is_empty() {
+            let _ = tx.send(LogMsg::Line(rest.to_string()));
+        }
+    })
+}
+
+/// Check whether a port can be bound on the given host (i.e. nothing else —
+/// including processes outside llmserve — is already listening on it).
+pub fn port_is_free(host: &str, port: u16) -> bool {
+    TcpListener::bind((host, port)).is_ok()
 }
 
 fn make_handle(
     backend: Backend,
     model: &DiscoveredModel,
-    port: u16,
-    host: String,
+    preset: &ResolvedPreset,
     mut child: Child,
 ) -> ServerHandle {
-    set_nonblocking(&mut child);
+    let (tx, rx) = channel();
+    let mut readers = Vec::new();
+    if let Some(stderr) = child.stderr.take() {
+        readers.push(spawn_reader(stderr, tx.clone()));
+    }
+    if let Some(stdout) = child.stdout.take() {
+        readers.push(spawn_reader(stdout, tx));
+    }
+
     let pid = child.id();
     ServerHandle {
         backend,
         model_name: model.name.clone(),
         pid,
-        port,
-        host,
+        port: preset.port,
+        host: preset.host.clone(),
         child,
         started_at: Instant::now(),
+        ready: false,
+        model: model.clone(),
+        preset: preset.clone(),
         log_lines: VecDeque::new(),
-        partial: String::new(),
+        rx,
+        readers,
+        last_probe: None,
+        last_was_progress: false,
     }
 }
 
@@ -270,13 +328,7 @@ fn launch_llama_server(
         .spawn()
         .map_err(|e| format!("Failed to start llama-server: {e}"))?;
 
-    Ok(make_handle(
-        Backend::LlamaServer,
-        model,
-        preset.port,
-        preset.host.clone(),
-        child,
-    ))
+    Ok(make_handle(Backend::LlamaServer, model, preset, child))
 }
 
 fn launch_mlx(model: &DiscoveredModel, preset: &ResolvedPreset) -> Result<ServerHandle, String> {
@@ -298,13 +350,7 @@ fn launch_mlx(model: &DiscoveredModel, preset: &ResolvedPreset) -> Result<Server
         .spawn()
         .map_err(|e| format!("Failed to start mlx_lm.server: {e}"))?;
 
-    Ok(make_handle(
-        Backend::MlxLm,
-        model,
-        preset.port,
-        preset.host.clone(),
-        child,
-    ))
+    Ok(make_handle(Backend::MlxLm, model, preset, child))
 }
 
 fn launch_koboldcpp(
@@ -341,13 +387,7 @@ fn launch_koboldcpp(
         .spawn()
         .map_err(|e| format!("Failed to start koboldcpp: {e}"))?;
 
-    Ok(make_handle(
-        Backend::KoboldCpp,
-        model,
-        preset.port,
-        preset.host.clone(),
-        child,
-    ))
+    Ok(make_handle(Backend::KoboldCpp, model, preset, child))
 }
 
 fn launch_localai(
@@ -386,13 +426,7 @@ fn launch_localai(
         .spawn()
         .map_err(|e| format!("Failed to start local-ai: {e}"))?;
 
-    Ok(make_handle(
-        Backend::LocalAi,
-        model,
-        preset.port,
-        preset.host.clone(),
-        child,
-    ))
+    Ok(make_handle(Backend::LocalAi, model, preset, child))
 }
 
 fn launch_lemonade(
@@ -421,26 +455,36 @@ fn launch_lemonade(
         .spawn()
         .map_err(|e| format!("Failed to start lemonade: {e}"))?;
 
-    Ok(make_handle(
-        Backend::Lemonade,
-        model,
-        preset.port,
-        preset.host.clone(),
-        child,
-    ))
+    Ok(make_handle(Backend::Lemonade, model, preset, child))
 }
 
 pub fn stop(handle: &mut ServerHandle) {
-    // Drain any remaining output before killing
-    handle.drain_output();
+    // Ask nicely first so the backend can release its port and clean up,
+    // then force-kill if it hasn't exited within the grace period.
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::kill(handle.pid as libc::pid_t, libc::SIGTERM);
+        }
+        for _ in 0..20 {
+            if matches!(handle.child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
     let _ = handle.child.kill();
     let _ = handle.child.wait();
+    handle.join_readers();
+    handle.drain_output();
 }
 
 pub fn check_exited(handle: &mut ServerHandle) -> Option<String> {
     match handle.child.try_wait() {
         Ok(Some(status)) => {
-            // Final drain
+            // The pipes are closed now; wait for the readers to flush the
+            // final output so the exit popup shows the actual error.
+            handle.join_readers();
             handle.drain_output();
             if status.success() {
                 Some("Server exited normally".into())

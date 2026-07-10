@@ -27,6 +27,7 @@ pub enum InputMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmField {
     Backend,
+    Host,
     Port,
     CtxSize,
     FlashAttn,
@@ -36,8 +37,9 @@ pub enum ConfirmField {
     ExtraArgs,
 }
 
-pub const CONFIRM_FIELDS: [ConfirmField; 8] = [
+pub const CONFIRM_FIELDS: [ConfirmField; 9] = [
     ConfirmField::Backend,
+    ConfirmField::Host,
     ConfirmField::Port,
     ConfirmField::CtxSize,
     ConfirmField::FlashAttn,
@@ -48,9 +50,13 @@ pub const CONFIRM_FIELDS: [ConfirmField; 8] = [
 ];
 
 /// Details about a server that exited on its own, shown in a popup modal.
+/// Carries the original model/backend/preset so the server can be relaunched
+/// with identical settings straight from the popup.
 #[derive(Debug, Clone)]
 pub struct ExitInfo {
-    pub model_name: String,
+    pub model: DiscoveredModel,
+    pub backend: Backend,
+    pub preset: crate::config::ResolvedPreset,
     pub backend_label: String,
     pub port: u16,
     pub message: String,
@@ -163,6 +169,9 @@ pub struct App {
     pub confirm_preset: ResolvedPreset,
     /// Index into CONFIRM_FIELDS of the selected field.
     pub confirm_field: usize,
+    /// Trained context length of the selected model (from its GGUF header),
+    /// used to warn when the configured ctx-size exceeds it.
+    pub confirm_model_ctx: Option<u64>,
     /// Whether the selected field is being text-edited.
     pub confirm_editing: bool,
     pub confirm_edit_buf: String,
@@ -178,6 +187,9 @@ pub struct App {
     pub serve_width: u16,
     /// Whether log output wraps long lines.
     pub log_wrap: bool,
+    /// Scroll offset in the log panel, in lines up from the bottom
+    /// (0 = pinned to the latest output).
+    pub log_scroll: usize,
     /// Whether the source tree panel is visible.
     pub show_tree: bool,
     /// Whether the serve/logs panel is visible (user can toggle even when empty).
@@ -203,42 +215,7 @@ impl App {
         let backends = detect_backends();
 
         let mut models = discover_models(&config.extra_model_dirs);
-
-        if let Some(ollama) = backends.iter().find(|b| b.backend == Backend::Ollama) {
-            if ollama.available {
-                if let Some(ref url) = ollama.api_url {
-                    let ollama_models = fetch_ollama_models(url);
-                    add_ollama_models(&mut models, ollama_models);
-                }
-            }
-        }
-
-        if let Some(lmstudio) = backends.iter().find(|b| b.backend == Backend::LmStudio) {
-            if lmstudio.available {
-                if let Some(ref url) = lmstudio.api_url {
-                    let lmstudio_models = fetch_lmstudio_models(url);
-                    add_lmstudio_models(&mut models, lmstudio_models);
-                }
-            }
-        }
-
-        if let Some(lemonade) = backends.iter().find(|b| b.backend == Backend::Lemonade) {
-            if lemonade.available {
-                if let Some(ref url) = lemonade.api_url {
-                    let lemonade_models = fetch_lemonade_models(url);
-                    add_lemonade_models(&mut models, lemonade_models);
-                }
-            }
-        }
-
-        if let Some(flm) = backends.iter().find(|b| b.backend == Backend::FastFlowLm) {
-            if flm.available {
-                if let Some(ref url) = flm.api_url {
-                    let flm_models = fetch_fastflowlm_models(url);
-                    add_fastflowlm_models(&mut models, flm_models);
-                }
-            }
-        }
+        fetch_api_models(&backends, &mut models);
 
         let selected_backend = if let Some(ref pref) = config.default_backend {
             backends
@@ -278,6 +255,7 @@ impl App {
             confirm_port_input: String::new(),
             confirm_preset: config.preset_for("llama-server"),
             confirm_field: 0,
+            confirm_model_ctx: None,
             confirm_editing: false,
             confirm_edit_buf: String::new(),
             tree_nodes,
@@ -286,6 +264,7 @@ impl App {
             tree_width: 30,
             serve_width: 38,
             log_wrap: false,
+            log_scroll: 0,
             show_tree: true,
             show_serve: false,
             add_dir_input: String::new(),
@@ -364,7 +343,9 @@ impl App {
                     self.tree_cursor += 1;
                 }
             }
-            Focus::Serve => {}
+            Focus::Serve => {
+                self.log_scroll = self.log_scroll.saturating_sub(1);
+            }
         }
     }
 
@@ -381,7 +362,10 @@ impl App {
                     self.tree_cursor -= 1;
                 }
             }
-            Focus::Serve => {}
+            Focus::Serve => {
+                // Clamped to the log length when drawn
+                self.log_scroll = self.log_scroll.saturating_add(1);
+            }
         }
     }
 
@@ -394,7 +378,9 @@ impl App {
             Focus::Tree => {
                 self.tree_cursor = 0;
             }
-            Focus::Serve => {}
+            Focus::Serve => {
+                self.log_scroll = usize::MAX; // clamped to the top when drawn
+            }
         }
     }
 
@@ -411,23 +397,37 @@ impl App {
                     self.tree_cursor = self.tree_nodes.len() - 1;
                 }
             }
-            Focus::Serve => {}
+            Focus::Serve => {
+                self.log_scroll = 0;
+            }
         }
     }
 
     pub fn half_page_down(&mut self) {
-        if self.focus == Focus::Table {
-            let jump = self.visible_rows / 2;
-            self.selected = (self.selected + jump).min(self.filtered.len().saturating_sub(1));
-            self.ensure_visible();
+        match self.focus {
+            Focus::Table => {
+                let jump = self.visible_rows / 2;
+                self.selected = (self.selected + jump).min(self.filtered.len().saturating_sub(1));
+                self.ensure_visible();
+            }
+            Focus::Serve => {
+                self.log_scroll = self.log_scroll.saturating_sub(10);
+            }
+            Focus::Tree => {}
         }
     }
 
     pub fn half_page_up(&mut self) {
-        if self.focus == Focus::Table {
-            let jump = self.visible_rows / 2;
-            self.selected = self.selected.saturating_sub(jump);
-            self.ensure_visible();
+        match self.focus {
+            Focus::Table => {
+                let jump = self.visible_rows / 2;
+                self.selected = self.selected.saturating_sub(jump);
+                self.ensure_visible();
+            }
+            Focus::Serve => {
+                self.log_scroll = self.log_scroll.saturating_add(10);
+            }
+            Focus::Tree => {}
         }
     }
 
@@ -741,6 +741,11 @@ impl App {
             return;
         };
         let format = model.format.clone();
+        let model_ctx = if model.path.extension().is_some_and(|e| e == "gguf") {
+            crate::models::read_gguf_meta(&model.path).and_then(|m| m.context_length)
+        } else {
+            None
+        };
 
         // Pre-select the first compatible + available backend
         let best = self
@@ -751,6 +756,7 @@ impl App {
 
         self.confirm_backend_idx = best;
         self.confirm_port_input = self.next_available_port().to_string();
+        self.confirm_model_ctx = model_ctx;
         self.confirm_field = 0;
         self.confirm_editing = false;
         self.confirm_edit_buf.clear();
@@ -870,6 +876,7 @@ impl App {
         let buf = match self.confirm_selected_field() {
             // Not text-editable
             ConfirmField::Backend | ConfirmField::FlashAttn => return,
+            ConfirmField::Host => self.confirm_preset.host.clone(),
             ConfirmField::Port => self.confirm_port_input.clone(),
             ConfirmField::CtxSize => self.confirm_preset.ctx_size.to_string(),
             ConfirmField::GpuLayers => self
@@ -903,6 +910,7 @@ impl App {
                 (c.is_ascii_digit() || (c == '-' && self.confirm_edit_buf.is_empty()))
                     && self.confirm_edit_buf.len() < 5
             }
+            ConfirmField::Host => !c.is_control() && !c.is_whitespace(),
             ConfirmField::ExtraArgs => !c.is_control(),
             ConfirmField::Backend | ConfirmField::FlashAttn => false,
         };
@@ -920,6 +928,11 @@ impl App {
     pub fn confirm_commit_edit(&mut self) {
         let buf = self.confirm_edit_buf.trim().to_string();
         match self.confirm_selected_field() {
+            ConfirmField::Host => {
+                if !buf.is_empty() {
+                    self.confirm_preset.host = buf;
+                }
+            }
             ConfirmField::Port => {
                 if buf.parse::<u16>().is_ok() {
                     self.confirm_port_input = buf;
@@ -963,6 +976,7 @@ impl App {
         entry.gpu_layers = p.gpu_layers;
         entry.threads = p.threads;
         entry.extra_args = p.extra_args.clone();
+        entry.host = Some(p.host.clone());
         if let Ok(port) = self.confirm_port_input.parse::<u16>() {
             entry.port = Some(port);
         }
@@ -1007,6 +1021,13 @@ impl App {
         let port = self.confirm_port();
         if self.servers.iter().any(|s| s.port == port) {
             self.status_message = Some(format!("Port {port} is already in use"));
+            return;
+        }
+
+        // Also catch ports held by processes outside llmserve (e.g. Ollama),
+        // which would otherwise surface as an instant crash.
+        if !server::port_is_free(&self.confirm_preset.host, port) {
+            self.status_message = Some(format!("Port {port} is already in use by another process"));
             return;
         }
 
@@ -1093,9 +1114,10 @@ impl App {
     // -- Tick --
 
     pub fn tick(&mut self) {
-        // Drain output from all running servers
+        // Drain output from all running servers and probe readiness
         for handle in &mut self.servers {
             handle.drain_output();
+            handle.probe_ready();
         }
 
         // Check for exits
@@ -1109,7 +1131,9 @@ impl App {
             let handle = self.servers.remove(i);
             // Queue a popup so the user sees why the server exited
             self.exit_popups.push_back(ExitInfo {
-                model_name: handle.model_name.clone(),
+                model: handle.model.clone(),
+                backend: handle.backend.clone(),
+                preset: handle.preset.clone(),
                 backend_label: handle.backend.label().to_string(),
                 port: handle.port,
                 message: msg.clone(),
@@ -1170,6 +1194,39 @@ impl App {
         self.exit_popup_scroll = self.exit_popup_scroll.saturating_sub(1);
     }
 
+    /// Relaunch the crashed server with the same model, backend, and settings.
+    pub fn restart_exited(&mut self) {
+        let Some(info) = self.exit_popups.pop_front() else {
+            return;
+        };
+        self.exit_popup_scroll = 0;
+        if self.exit_popups.is_empty() {
+            self.input_mode = InputMode::Normal;
+        }
+
+        if !server::port_is_free(&info.preset.host, info.preset.port) {
+            self.status_message = Some(format!(
+                "Cannot restart: port {} is already in use",
+                info.preset.port
+            ));
+            return;
+        }
+
+        match server::launch_with(&info.model, &info.backend, &info.preset) {
+            Ok(handle) => {
+                self.status_message = Some(format!(
+                    "Restarted {} on port {}",
+                    handle.model_name, handle.port
+                ));
+                self.servers.push(handle);
+                self.show_serve = true;
+            }
+            Err(e) => {
+                self.status_message = Some(e);
+            }
+        }
+    }
+
     /// Get all log lines to display — combines live server logs and dead logs.
     pub fn all_log_lines(&self) -> Vec<(&str, &str)> {
         let mut lines = Vec::new();
@@ -1194,6 +1251,7 @@ impl App {
 
     pub fn clear_dead_logs(&mut self) {
         self.dead_logs.clear();
+        self.log_scroll = 0;
     }
 
     /// Whether there are any logs to show (live or dead).
@@ -1211,55 +1269,7 @@ impl App {
 
     fn rebuild_models(&mut self) {
         self.models = discover_models(&self.config.extra_model_dirs);
-
-        if let Some(ollama) = self.backends.iter().find(|b| b.backend == Backend::Ollama) {
-            if ollama.available {
-                if let Some(ref url) = ollama.api_url {
-                    let ollama_models = fetch_ollama_models(url);
-                    add_ollama_models(&mut self.models, ollama_models);
-                }
-            }
-        }
-
-        if let Some(lmstudio) = self
-            .backends
-            .iter()
-            .find(|b| b.backend == Backend::LmStudio)
-        {
-            if lmstudio.available {
-                if let Some(ref url) = lmstudio.api_url {
-                    let lmstudio_models = fetch_lmstudio_models(url);
-                    add_lmstudio_models(&mut self.models, lmstudio_models);
-                }
-            }
-        }
-
-        if let Some(lemonade) = self
-            .backends
-            .iter()
-            .find(|b| b.backend == Backend::Lemonade)
-        {
-            if lemonade.available {
-                if let Some(ref url) = lemonade.api_url {
-                    let lemonade_models = fetch_lemonade_models(url);
-                    add_lemonade_models(&mut self.models, lemonade_models);
-                }
-            }
-        }
-
-        if let Some(flm) = self
-            .backends
-            .iter()
-            .find(|b| b.backend == Backend::FastFlowLm)
-        {
-            if flm.available {
-                if let Some(ref url) = flm.api_url {
-                    let flm_models = fetch_fastflowlm_models(url);
-                    add_fastflowlm_models(&mut self.models, flm_models);
-                }
-            }
-        }
-
+        fetch_api_models(&self.backends, &mut self.models);
         self.tree_nodes = build_tree(&self.models, &self.config);
         self.apply_filters();
     }
@@ -1274,6 +1284,49 @@ impl App {
 
 fn first_available(backends: &[DetectedBackend]) -> usize {
     backends.iter().position(|b| b.available).unwrap_or(0)
+}
+
+/// Fetch model lists from all available API-backed backends concurrently
+/// (each fetch has an 800ms timeout, so serial fetching would stack up)
+/// and merge them into `models`.
+fn fetch_api_models(backends: &[DetectedBackend], models: &mut Vec<DiscoveredModel>) {
+    let url_for = |backend: Backend| {
+        backends
+            .iter()
+            .find(|d| d.backend == backend)
+            .filter(|d| d.available)
+            .and_then(|d| d.api_url.clone())
+    };
+    let ollama_url = url_for(Backend::Ollama);
+    let lmstudio_url = url_for(Backend::LmStudio);
+    let lemonade_url = url_for(Backend::Lemonade);
+    let flm_url = url_for(Backend::FastFlowLm);
+
+    let (ollama, lmstudio, lemonade, flm) = std::thread::scope(|s| {
+        let ollama = s.spawn(|| ollama_url.as_deref().map(fetch_ollama_models));
+        let lmstudio = s.spawn(|| lmstudio_url.as_deref().map(fetch_lmstudio_models));
+        let lemonade = s.spawn(|| lemonade_url.as_deref().map(fetch_lemonade_models));
+        let flm = s.spawn(|| flm_url.as_deref().map(fetch_fastflowlm_models));
+        (
+            ollama.join().ok().flatten(),
+            lmstudio.join().ok().flatten(),
+            lemonade.join().ok().flatten(),
+            flm.join().ok().flatten(),
+        )
+    });
+
+    if let Some(list) = ollama {
+        add_ollama_models(models, list);
+    }
+    if let Some(list) = lmstudio {
+        add_lmstudio_models(models, list);
+    }
+    if let Some(list) = lemonade {
+        add_lemonade_models(models, list);
+    }
+    if let Some(list) = flm {
+        add_fastflowlm_models(models, list);
+    }
 }
 
 /// Build the source tree from discovered models.

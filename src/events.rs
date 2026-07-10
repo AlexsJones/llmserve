@@ -164,6 +164,7 @@ fn handle_stop_popup(app: &mut App, key: KeyEvent) {
 fn handle_server_exit_popup(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.dismiss_exit_popup(),
+        KeyCode::Char('r') => app.restart_exited(),
         KeyCode::Down | KeyCode::Char('j') => app.exit_popup_scroll_down(),
         KeyCode::Up | KeyCode::Char('k') => app.exit_popup_scroll_up(),
         _ => {}

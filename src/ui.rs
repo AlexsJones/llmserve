@@ -252,7 +252,6 @@ fn draw_model_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColo
         .map(|(display_idx, &model_idx)| {
             let m = &app.models[model_idx];
             let is_selected = focused && display_idx == app.selected;
-            let is_serving = app.is_model_served(&m.name);
 
             let style = if is_selected {
                 Style::default().bg(tc.highlight_bg).fg(tc.fg)
@@ -262,16 +261,16 @@ fn draw_model_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColo
 
             let vision = if m.mmproj.is_some() { " [V]" } else { "" };
 
-            let status = if is_serving {
-                let srv = app.servers.iter().find(|s| s.model_name == m.name).unwrap();
-                format!(":{} ({})", srv.port, srv.backend.label())
-            } else {
-                String::new()
+            let srv = app.servers.iter().find(|s| s.model_name == m.name);
+            let status = match srv {
+                Some(s) if s.ready => format!(":{} ({})", s.port, s.backend.label()),
+                Some(s) => format!(":{} loading…", s.port),
+                None => String::new(),
             };
-            let status_style = if is_serving {
-                Style::default().fg(tc.good)
-            } else {
-                style
+            let status_style = match srv {
+                Some(s) if s.ready => Style::default().fg(tc.good),
+                Some(_) => Style::default().fg(tc.warning),
+                None => style,
             };
 
             Row::new(vec![
@@ -305,7 +304,7 @@ fn draw_model_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColo
     frame.render_widget(table, area);
 }
 
-fn draw_right_panel(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
+fn draw_right_panel(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
     // Split vertically: server cards on top, logs on bottom
     let server_card_height = if app.servers.is_empty() {
         0
@@ -345,23 +344,37 @@ fn draw_server_cards(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors)
         let name: String = s
             .model_name
             .chars()
-            .take(inner_width.saturating_sub(2))
+            .take(inner_width.saturating_sub(4))
             .collect();
-        lines.push(
-            Line::from(format!(" {name}"))
-                .style(Style::default().fg(tc.fg).add_modifier(Modifier::BOLD)),
-        );
-        lines.push(Line::from(vec![Span::styled(
-            format!(
-                "  {} :{} │ {}",
-                s.backend.label(),
-                s.port,
-                s.uptime_display()
+        let (state, state_color) = if s.ready {
+            ("●", tc.good)
+        } else {
+            ("◌", tc.warning)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {state} "), Style::default().fg(state_color)),
+            Span::styled(
+                name,
+                Style::default().fg(tc.fg).add_modifier(Modifier::BOLD),
             ),
-            Style::default().fg(tc.accent),
-        )]));
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(
+                    "   {} :{} │ {}",
+                    s.backend.label(),
+                    s.port,
+                    s.uptime_display()
+                ),
+                Style::default().fg(tc.accent),
+            ),
+            Span::styled(
+                if s.ready { "" } else { " │ loading…" },
+                Style::default().fg(tc.warning),
+            ),
+        ]));
         lines.push(Line::from(vec![Span::styled(
-            format!("  PID {} │ {}", s.pid, s.display_url()),
+            format!("   PID {} │ {}", s.pid, s.display_url()),
             Style::default().fg(tc.muted),
         )]));
     }
@@ -369,18 +382,24 @@ fn draw_server_cards(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors)
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_log_panel(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
+fn draw_log_panel(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
     let focused = app.focus == Focus::Serve && app.input_mode == InputMode::Normal;
     let wrap_label = if app.log_wrap { "wrap:on" } else { "wrap:off" };
+
+    let title = if app.log_scroll > 0 {
+        format!(" Logs (scrolled ▲{}) ", app.log_scroll)
+    } else {
+        " Logs ".to_string()
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(if focused { tc.accent } else { tc.border }))
-        .title(" Logs ")
+        .title(title)
         .title_style(Style::default().fg(tc.title).add_modifier(Modifier::BOLD))
         .title_bottom(
-            Line::from(format!(" [w]:{wrap_label} [C]:clear [S+←→]:resize "))
+            Line::from(format!(" j/k:scroll [w]:{wrap_label} [C]:clear "))
                 .right_aligned()
                 .style(Style::default().fg(tc.muted)),
         )
@@ -424,8 +443,10 @@ fn draw_log_panel(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         }
     }
 
-    // Auto-scroll to bottom
-    let skip = display_lines.len().saturating_sub(visible);
+    // Pinned to the bottom unless the user scrolled up
+    let max_scroll = display_lines.len().saturating_sub(visible);
+    app.log_scroll = app.log_scroll.min(max_scroll);
+    let skip = display_lines.len().saturating_sub(visible + app.log_scroll);
 
     let lines: Vec<Line> = display_lines
         .iter()
@@ -480,7 +501,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     let help = match app.input_mode {
         InputMode::Search => "type to filter │ Enter:confirm │ Esc:clear",
         InputMode::StopPopup => "j/k:select │ Enter:stop │ Esc:cancel",
-        InputMode::ServerExit => "j/k:scroll │ Enter/Esc:dismiss",
+        InputMode::ServerExit => "j/k:scroll │ r:restart │ Enter/Esc:dismiss",
         InputMode::ConfirmServe => {
             "j/k:field │ h/l/Space:change │ e:edit │ s:save default │ Enter:serve │ Esc:cancel"
         }
@@ -563,7 +584,7 @@ fn draw_backend_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 }
 
 fn draw_confirm_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
-    let area = centered_rect(62, 17, frame.area());
+    let area = centered_rect(62, 18, frame.area());
     frame.render_widget(Clear, area);
 
     let block = Block::default()
@@ -616,6 +637,7 @@ fn draw_confirm_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
                 format!("< {backend_label} >"),
                 String::new(), // status span appended below
             ),
+            ConfirmField::Host => ("Host", preset.host.clone(), String::new()),
             ConfirmField::Port => ("Port", app.confirm_port_input.clone(), String::new()),
             ConfirmField::CtxSize => (
                 "Context",
@@ -624,7 +646,13 @@ fn draw_confirm_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
                     if preset.use_ctx_size { "x" } else { " " },
                     preset.ctx_size
                 ),
-                "(Space toggles)".into(),
+                match app.confirm_model_ctx {
+                    Some(max) if u64::from(preset.ctx_size) > max => {
+                        format!("(exceeds model max {max}!)")
+                    }
+                    Some(max) => format!("(model max {max})"),
+                    None => "(Space toggles)".into(),
+                },
             ),
             ConfirmField::FlashAttn => (
                 "Flash attn",
@@ -860,7 +888,7 @@ fn draw_server_exit_popup(frame: &mut Frame, app: &mut App, tc: &ThemeColors) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tc.error))
         .title_bottom(
-            Line::from(" j/k:scroll │ Enter/Esc:dismiss ")
+            Line::from(" j/k:scroll │ r:restart │ Enter/Esc:dismiss ")
                 .right_aligned()
                 .style(Style::default().fg(tc.muted)),
         )
@@ -873,7 +901,7 @@ fn draw_server_exit_popup(frame: &mut Frame, app: &mut App, tc: &ThemeColors) {
         Line::from(vec![
             Span::styled("  Model:   ", Style::default().fg(tc.muted)),
             Span::styled(
-                info.model_name.clone(),
+                info.model.name.clone(),
                 Style::default().fg(tc.fg).add_modifier(Modifier::BOLD),
             ),
         ]),

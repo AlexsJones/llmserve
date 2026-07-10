@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.0.10](https://github.com/AlexsJones/llmserve/compare/v0.0.9...v0.0.10) (2026-07-10)
+
+
+### Features
+
+* faster startup, crash restart, readiness states, and robustness improvements ([74a5b21](https://github.com/AlexsJones/llmserve/commit/74a5b2126f7095859c0e6bc239b80649a0ac94b2))
+* faster startup, crash restart, readiness states, and robustness improvements ([a6b2fe5](https://github.com/AlexsJones/llmserve/commit/a6b2fe5d981a01e52382f6daf6015fd48cdc05f4))
+
 ## [0.0.9](https://github.com/AlexsJones/llmserve/compare/v0.0.8...v0.0.9) (2026-07-10)
 
 

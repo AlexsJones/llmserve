@@ -19,6 +19,7 @@ pub fn handle_events(app: &mut App) -> std::io::Result<bool> {
             InputMode::ConfirmServe => handle_confirm(app, key),
             InputMode::StopPopup => handle_stop_popup(app, key),
             InputMode::AddDir => handle_add_dir(app, key),
+            InputMode::ServerExit => handle_server_exit_popup(app, key),
         }
         return Ok(true);
     }
@@ -125,14 +126,12 @@ fn handle_backend_popup(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_confirm(app: &mut App, key: KeyEvent) {
-    if app.confirm_editing_port {
+    if app.confirm_editing {
         match key.code {
-            KeyCode::Char(c) if c.is_ascii_digit() => app.confirm_port_push(c),
-            KeyCode::Backspace => app.confirm_port_pop(),
-            KeyCode::Tab | KeyCode::Enter => app.confirm_toggle_port_edit(),
-            KeyCode::Esc => {
-                app.confirm_editing_port = false;
-            }
+            KeyCode::Enter | KeyCode::Tab => app.confirm_commit_edit(),
+            KeyCode::Esc => app.confirm_cancel_edit(),
+            KeyCode::Backspace => app.confirm_edit_pop(),
+            KeyCode::Char(c) => app.confirm_edit_push(c),
             _ => {}
         }
         return;
@@ -141,10 +140,13 @@ fn handle_confirm(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Enter | KeyCode::Char('y') => app.do_serve(),
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => app.cancel_popup(),
-        KeyCode::Left | KeyCode::Char('h') => app.confirm_cycle_backend_left(),
-        KeyCode::Right | KeyCode::Char('l') => app.confirm_cycle_backend_right(),
-        KeyCode::Tab | KeyCode::Char('p') => app.confirm_toggle_port_edit(),
-        KeyCode::Char(' ') => app.toggle_use_ctx_size(),
+        KeyCode::Down | KeyCode::Char('j') => app.confirm_field_down(),
+        KeyCode::Up | KeyCode::Char('k') => app.confirm_field_up(),
+        KeyCode::Left | KeyCode::Char('h') => app.confirm_field_left(),
+        KeyCode::Right | KeyCode::Char('l') => app.confirm_field_right(),
+        KeyCode::Char(' ') => app.confirm_toggle(),
+        KeyCode::Tab | KeyCode::Char('e') | KeyCode::Char('p') => app.confirm_begin_edit(),
+        KeyCode::Char('s') => app.confirm_save_preset(),
         _ => {}
     }
 }
@@ -155,6 +157,15 @@ fn handle_stop_popup(app: &mut App, key: KeyEvent) {
         KeyCode::Down | KeyCode::Char('j') => app.stop_popup_down(),
         KeyCode::Up | KeyCode::Char('k') => app.stop_popup_up(),
         KeyCode::Enter => app.confirm_stop(),
+        _ => {}
+    }
+}
+
+fn handle_server_exit_popup(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.dismiss_exit_popup(),
+        KeyCode::Down | KeyCode::Char('j') => app.exit_popup_scroll_down(),
+        KeyCode::Up | KeyCode::Char('k') => app.exit_popup_scroll_up(),
         _ => {}
     }
 }

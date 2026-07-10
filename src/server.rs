@@ -1,5 +1,5 @@
 use crate::backends::Backend;
-use crate::config::Config;
+use crate::config::{Config, ResolvedPreset};
 use crate::models::DiscoveredModel;
 use std::collections::VecDeque;
 use std::io::Read;
@@ -163,6 +163,16 @@ pub fn launch(
     backend: &Backend,
     config: &Config,
 ) -> Result<ServerHandle, String> {
+    let key = crate::backends::backend_key(backend);
+    launch_with(model, backend, &config.preset_for(key))
+}
+
+/// Launch with an explicit resolved preset (e.g. edited in the confirm modal).
+pub fn launch_with(
+    model: &DiscoveredModel,
+    backend: &Backend,
+    preset: &ResolvedPreset,
+) -> Result<ServerHandle, String> {
     // Check compatibility: can this backend serve this local model file?
     if !backend.can_serve_local(&model.format) {
         let reason = backend
@@ -177,11 +187,11 @@ pub fn launch(
     }
 
     match backend {
-        Backend::LlamaServer => launch_llama_server(model, config),
-        Backend::MlxLm => launch_mlx(model, config),
-        Backend::KoboldCpp => launch_koboldcpp(model, config),
-        Backend::LocalAi => launch_localai(model, config),
-        Backend::Lemonade => launch_lemonade(model, config),
+        Backend::LlamaServer => launch_llama_server(model, preset),
+        Backend::MlxLm => launch_mlx(model, preset),
+        Backend::KoboldCpp => launch_koboldcpp(model, preset),
+        Backend::LocalAi => launch_localai(model, preset),
+        Backend::Lemonade => launch_lemonade(model, preset),
         // These are blocked by the can_serve_local check above,
         // but match exhaustively for safety.
         Backend::Ollama | Backend::LmStudio | Backend::Vllm | Backend::FastFlowLm => Err(format!(
@@ -191,24 +201,27 @@ pub fn launch(
     }
 }
 
-pub fn launch_on_port(
-    model: &DiscoveredModel,
-    backend: &Backend,
-    config: &Config,
-    port: u16,
-) -> Result<ServerHandle, String> {
-    let mut config = config.clone();
-    let key = crate::backends::backend_key(backend);
-    if let Some(preset) = config.presets.get_mut(key) {
-        preset.port = Some(port);
-    }
-    config.preferred_port = port;
-    launch(model, backend, &config)
+/// Newer llama.cpp (≥ b6325) takes `--flash-attn <on|off|auto>`; older builds
+/// (e.g. Fedora's b6153) take it as a bare boolean flag and exit with
+/// "invalid argument: on" otherwise. Probe once: with the new syntax
+/// `--version` parses and exits 0, with the old syntax arg parsing fails first.
+fn llama_flash_attn_takes_value() -> bool {
+    static TAKES_VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TAKES_VALUE.get_or_init(|| {
+        Command::new("llama-server")
+            .args(["--flash-attn", "on", "--version"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(true)
+    })
 }
 
-fn launch_llama_server(model: &DiscoveredModel, config: &Config) -> Result<ServerHandle, String> {
-    let preset = config.preset_for("llama-server");
-
+fn launch_llama_server(
+    model: &DiscoveredModel,
+    preset: &ResolvedPreset,
+) -> Result<ServerHandle, String> {
     let mut cmd = Command::new("llama-server");
     cmd.arg("--model")
         .arg(&model.path)
@@ -222,7 +235,11 @@ fn launch_llama_server(model: &DiscoveredModel, config: &Config) -> Result<Serve
     }
 
     if preset.flash_attn {
-        cmd.arg("--flash-attn").arg("on");
+        if llama_flash_attn_takes_value() {
+            cmd.arg("--flash-attn").arg("on");
+        } else {
+            cmd.arg("--flash-attn");
+        }
     }
 
     if let Some(batch_size) = preset.batch_size {
@@ -257,14 +274,12 @@ fn launch_llama_server(model: &DiscoveredModel, config: &Config) -> Result<Serve
         Backend::LlamaServer,
         model,
         preset.port,
-        preset.host,
+        preset.host.clone(),
         child,
     ))
 }
 
-fn launch_mlx(model: &DiscoveredModel, config: &Config) -> Result<ServerHandle, String> {
-    let preset = config.preset_for("mlx");
-
+fn launch_mlx(model: &DiscoveredModel, preset: &ResolvedPreset) -> Result<ServerHandle, String> {
     let mut cmd = Command::new("python3");
     cmd.arg("-m")
         .arg("mlx_lm.server")
@@ -287,14 +302,15 @@ fn launch_mlx(model: &DiscoveredModel, config: &Config) -> Result<ServerHandle, 
         Backend::MlxLm,
         model,
         preset.port,
-        preset.host,
+        preset.host.clone(),
         child,
     ))
 }
 
-fn launch_koboldcpp(model: &DiscoveredModel, config: &Config) -> Result<ServerHandle, String> {
-    let preset = config.preset_for("koboldcpp");
-
+fn launch_koboldcpp(
+    model: &DiscoveredModel,
+    preset: &ResolvedPreset,
+) -> Result<ServerHandle, String> {
     let mut cmd = Command::new("koboldcpp");
     cmd.arg("--model")
         .arg(&model.path)
@@ -329,14 +345,15 @@ fn launch_koboldcpp(model: &DiscoveredModel, config: &Config) -> Result<ServerHa
         Backend::KoboldCpp,
         model,
         preset.port,
-        preset.host,
+        preset.host.clone(),
         child,
     ))
 }
 
-fn launch_localai(model: &DiscoveredModel, config: &Config) -> Result<ServerHandle, String> {
-    let preset = config.preset_for("localai");
-
+fn launch_localai(
+    model: &DiscoveredModel,
+    preset: &ResolvedPreset,
+) -> Result<ServerHandle, String> {
     // LocalAI serves models from a directory. We point --models-path at the
     // parent directory of the GGUF file so it discovers it automatically.
     let models_dir = model
@@ -373,14 +390,15 @@ fn launch_localai(model: &DiscoveredModel, config: &Config) -> Result<ServerHand
         Backend::LocalAi,
         model,
         preset.port,
-        preset.host,
+        preset.host.clone(),
         child,
     ))
 }
 
-fn launch_lemonade(model: &DiscoveredModel, config: &Config) -> Result<ServerHandle, String> {
-    let preset = config.preset_for("lemonade");
-
+fn launch_lemonade(
+    model: &DiscoveredModel,
+    preset: &ResolvedPreset,
+) -> Result<ServerHandle, String> {
     let mut cmd = Command::new("lemonade");
     cmd.arg("load")
         .arg(model.path.to_string_lossy().as_ref())
@@ -407,7 +425,7 @@ fn launch_lemonade(model: &DiscoveredModel, config: &Config) -> Result<ServerHan
         Backend::Lemonade,
         model,
         preset.port,
-        preset.host,
+        preset.host.clone(),
         child,
     ))
 }

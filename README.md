@@ -31,9 +31,12 @@ curl -fsSL https://llmserve.axjns.dev/install.sh | sh
 
 ### Homebrew
 ```sh
+brew trust AlexsJones/llmserve
 brew tap AlexsJones/llmserve
 brew install llmserve
 ```
+
+> Homebrew 5.1.15+ refuses to load formulae from untrusted third-party taps, so `brew trust` is required before `brew install`. On older versions the `brew trust` line is unnecessary (and unavailable); skip it.
 
 ### Cargo
 ```sh

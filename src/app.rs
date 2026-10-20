@@ -5,7 +5,7 @@ use crate::backends::{
 use crate::config::{Config, ResolvedPreset};
 use crate::models::{
     DiscoveredModel, ModelFormat, ModelSource, add_fastflowlm_models, add_lemonade_models,
-    add_lmstudio_models, add_ollama_models, discover_models,
+    add_lmstudio_models, add_ollama_models, discover_models, hf_hub_dir,
 };
 use crate::server::{self, ServerHandle};
 use crate::theme::Theme;
@@ -1355,11 +1355,7 @@ fn build_tree(models: &[DiscoveredModel], config: &Config) -> Vec<TreeNode> {
         (
             ModelSource::HfCache,
             "HF/MLX",
-            Some(
-                std::env::var("HF_HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| home.join(".cache").join("huggingface").join("hub")),
-            ),
+            Some(hf_hub_dir(&home, std::env::var("HF_HOME").ok())),
         ),
         (
             ModelSource::LlmFit,

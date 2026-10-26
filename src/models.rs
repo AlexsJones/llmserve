@@ -141,15 +141,7 @@ pub fn discover_models(extra_dirs: &[PathBuf]) -> Vec<DiscoveredModel> {
     );
 
     // HuggingFace cache — MLX models
-    let hf_hub = std::env::var("HF_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            if cfg!(windows) {
-                home.join(".cache").join("huggingface").join("hub")
-            } else {
-                home.join(".cache").join("huggingface").join("hub")
-            }
-        });
+    let hf_hub = hf_hub_dir(&home, std::env::var("HF_HOME").ok());
     scan_mlx_models(&hf_hub, &mut models, &mut seen_paths);
 
     // Extra user-configured directories
@@ -159,6 +151,14 @@ pub fn discover_models(extra_dirs: &[PathBuf]) -> Vec<DiscoveredModel> {
 
     models.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     models
+}
+
+/// HuggingFace hub cache: `$HF_HOME/hub`, or `~/.cache/huggingface/hub` when unset.
+pub fn hf_hub_dir(home: &Path, hf_home: Option<String>) -> PathBuf {
+    match hf_home {
+        Some(root) => PathBuf::from(root).join("hub"),
+        None => home.join(".cache").join("huggingface").join("hub"),
+    }
 }
 
 fn scan_gguf_dir(
@@ -906,6 +906,32 @@ mod tests {
 
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].name, "Qwen3-8B-GGUF");
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn hf_home_is_the_root_of_the_hub_cache() {
+        let tmp =
+            std::env::temp_dir().join(format!("llmserve_test_hf_home_{}", std::process::id()));
+        let snap = tmp.join("hub/models--mlx-community--Qwen3-4B-4bit/snapshots/abc");
+        fs::create_dir_all(&snap).unwrap();
+        fs::write(snap.join("config.json"), b"{}").unwrap();
+        fs::write(snap.join("model.safetensors"), b"x").unwrap();
+
+        let home = Path::new("/home/u");
+        let hub = hf_hub_dir(home, Some(tmp.to_string_lossy().into_owned()));
+        let mut models = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        scan_mlx_models(&hub, &mut models, &mut seen);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name, "mlx-community/Qwen3-4B-4bit");
+        // Unset keeps the default location.
+        assert_eq!(
+            hf_hub_dir(home, None),
+            Path::new("/home/u/.cache/huggingface/hub")
+        );
 
         fs::remove_dir_all(&tmp).unwrap();
     }

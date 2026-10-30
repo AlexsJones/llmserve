@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.11](https://github.com/AlexsJones/llmserve/compare/v0.0.10...v0.0.11) (2026-10-30)
+
+
+### Bug Fixes
+
+* look for MLX models in $HF_HOME/hub ([#61](https://github.com/AlexsJones/llmserve/issues/61)) ([0bc9f04](https://github.com/AlexsJones/llmserve/commit/0bc9f04fed0ac68eceb02d7749d97a979a2ad2a0))
+
 ## [0.0.10](https://github.com/AlexsJones/llmserve/compare/v0.0.9...v0.0.10) (2026-07-10)
 
 

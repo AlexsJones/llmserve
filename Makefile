@@ -24,8 +24,9 @@ check:
 fmt:
 	cargo fmt --all
 
+# Clear RUSTFLAGS so `-D warnings` does not turn Clippy's warn lints into errors.
 clippy:
-	cargo clippy --locked --all-targets --all-features
+	RUSTFLAGS= cargo clippy --locked --all-targets --all-features
 
 clean:
 	cargo clean

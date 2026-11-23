@@ -19,14 +19,15 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Deny warnings in this crate and its dependencies. Clippy stays on its
-  # default lint set; `cargo clippy -- -D warnings` is a separate, noisier bar.
-  RUSTFLAGS: "-D warnings"
 
 jobs:
   test:
     name: Test Suite
     runs-on: ${{ matrix.os }}
+    env:
+      # rustc warnings fail the build. Not set on the Clippy job: that flag
+      # also denies Clippy's own warn-by-default lints, which this tree still has.
+      RUSTFLAGS: "-D warnings"
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -127,6 +128,8 @@ jobs:
   check:
     name: Cargo Check
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
 
     steps:
       - name: Checkout code

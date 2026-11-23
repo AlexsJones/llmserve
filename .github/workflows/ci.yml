@@ -19,6 +19,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Deny warnings in this crate and its dependencies. Clippy stays on its
+  # default lint set; `cargo clippy -- -D warnings` is a separate, noisier bar.
+  RUSTFLAGS: "-D warnings"
 
 jobs:
   test:
@@ -63,7 +66,7 @@ jobs:
             ${{ runner.os }}-cargo-target-
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --locked --verbose
 
   fmt:
     name: Rustfmt
@@ -119,7 +122,7 @@ jobs:
             ${{ runner.os }}-cargo-target-
 
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --locked --all-targets --all-features
 
   check:
     name: Cargo Check
@@ -133,4 +136,4 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Run cargo check
-        run: cargo check --all-targets --all-features
+        run: cargo check --locked --all-targets --all-features

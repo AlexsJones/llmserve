@@ -402,6 +402,135 @@ fn lmstudio_serve_returns_error() {
     );
 }
 
+/// Launch llama-server through the binary-override hook, wait until /health
+/// answers, check the argv the child received, then stop it.
+///
+/// The child is `tests/fixtures/fake_backend.rs`, compiled with the rustc
+/// that is already on PATH in CI. No model file and no real backend.
+#[test]
+fn serve_fake_backend_becomes_ready_and_stops() {
+    let work = std::env::temp_dir().join(format!(
+        "llmserve-fake-serve-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&work).unwrap();
+
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_backend.rs");
+    let exe_name = if cfg!(windows) {
+        "fake-llama-server.exe"
+    } else {
+        "fake-llama-server"
+    };
+    let exe = work.join(exe_name);
+    let compiled = std::process::Command::new("rustc")
+        .arg("--edition=2021")
+        .arg(&src)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+        .expect("rustc is installed in CI");
+    assert!(compiled.success(), "fake backend failed to compile");
+
+    // fake_backend.rs writes argv next to its own executable.
+    let args_file = exe.with_file_name("argv.txt");
+    let model_path = work.join("model.gguf");
+    let port = free_port();
+
+    // Drop guards so a failed assertion still reaps the child and clears the hook.
+    struct Cleanup {
+        work: PathBuf,
+        handle: Option<server::ServerHandle>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.as_mut() {
+                server::stop(handle);
+            }
+            server::clear_binary_override("llama-server");
+            let _ = std::fs::remove_dir_all(&self.work);
+        }
+    }
+    let mut cleanup = Cleanup {
+        work: work.clone(),
+        handle: None,
+    };
+
+    server::set_binary_override("llama-server", &exe);
+
+    let model = DiscoveredModel {
+        name: "fake-model".into(),
+        path: model_path.clone(),
+        mmproj: None,
+        format: ModelFormat::Gguf,
+        size_bytes: 0,
+        quant: None,
+        param_hint: None,
+        source: ModelSource::ExtraDir,
+    };
+    let mut preset = Config::default().preset_for("llama-server");
+    preset.host = "127.0.0.1".into();
+    preset.port = port;
+    preset.flash_attn = false;
+    preset.use_ctx_size = false;
+    preset.batch_size = None;
+    preset.gpu_layers = None;
+    preset.threads = None;
+    preset.extra_args.clear();
+
+    cleanup.handle = Some(
+        server::launch_with(&model, &Backend::LlamaServer, &preset).expect("spawn fake backend"),
+    );
+    let handle = cleanup.handle.as_mut().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        handle.drain_output();
+        handle.probe_ready();
+        if handle.ready {
+            break;
+        }
+        if let Some(message) = server::check_exited(handle) {
+            panic!(
+                "fake backend exited before /health: {message}\nlogs: {:?}",
+                handle.log_lines
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        handle.ready,
+        "fake backend did not answer /health on 127.0.0.1:{port}\nlogs: {:?}",
+        handle.log_lines
+    );
+
+    let recorded = std::fs::read_to_string(&args_file).expect("argv record");
+    let port_text = port.to_string();
+    let model_text = model_path.to_str().expect("unicode model path").to_string();
+    assert_eq!(
+        recorded.lines().collect::<Vec<_>>(),
+        vec![
+            "--model",
+            model_text.as_str(),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            port_text.as_str(),
+        ]
+    );
+
+    server::stop(handle);
+    match handle.child.try_wait() {
+        Ok(Some(_)) => {}
+        other => panic!("fake backend should be reaped after stop, got {other:?}"),
+    }
+    // Already reaped. Drop must not stop it a second time.
+    cleanup.handle = None;
+}
+
 /// Test that model discovery doesn't crash on nonexistent directories.
 #[test]
 fn discover_models_nonexistent_dir() {

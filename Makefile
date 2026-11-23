@@ -1,31 +1,34 @@
 .PHONY: build release run test check fmt clippy clean install
 
+# Match CI: fail the build on rustc warnings, and do not resolve past Cargo.lock.
+export RUSTFLAGS ?= -D warnings
+
 build:
-	cargo build
+	cargo build --locked
 
 release:
-	cargo build --release
+	cargo build --locked --release
 
 run:
-	cargo run
+	cargo run --locked
 
 test:
-	cargo test
+	cargo test --locked
 
 test-local:
-	cargo test -- --include-ignored
+	cargo test --locked -- --include-ignored
 
 check:
-	cargo check --all-targets --all-features
+	cargo check --locked --all-targets --all-features
 
 fmt:
 	cargo fmt --all
 
 clippy:
-	cargo clippy --all-targets --all-features
+	cargo clippy --locked --all-targets --all-features
 
 clean:
 	cargo clean
 
 install:
-	cargo install --path .
+	cargo install --locked --path .

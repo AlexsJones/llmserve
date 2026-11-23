@@ -15,6 +15,21 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// Detection order. Kept in one place so the serve dialog and tests agree.
+    pub const ALL: [Backend; 9] = [
+        Backend::LlamaServer,
+        Backend::Ollama,
+        Backend::MlxLm,
+        Backend::LmStudio,
+        Backend::Vllm,
+        Backend::KoboldCpp,
+        Backend::LocalAi,
+        Backend::Lemonade,
+        Backend::FastFlowLm,
+    ];
+}
+
+impl Backend {
     pub fn label(&self) -> &'static str {
         match self {
             Backend::LlamaServer => "llama-server",
@@ -48,6 +63,34 @@ impl Backend {
             crate::models::ModelFormat::Gguf => self.can_serve_local_gguf(),
             crate::models::ModelFormat::Mlx => self.can_serve_local_mlx(),
         }
+    }
+
+    /// Whether llmserve can launch this backend for this specific entry.
+    ///
+    /// Registry rows (`ollama:<name>`, `lmstudio:<id>`, and the same for
+    /// Lemonade and FastFlowLM) are not files. llama-server, KoboldCpp, and
+    /// the other file backends cannot load them, and llmserve does not launch
+    /// the registry's own server either. A GGUF that LM Studio stored on disk
+    /// is a normal file and stays launchable.
+    pub fn can_serve(&self, model: &crate::models::DiscoveredModel) -> bool {
+        if crate::models::registry_kind(&model.path).is_some() {
+            return false;
+        }
+        self.can_serve_local(&model.format)
+    }
+
+    /// Why [`can_serve`](Self::can_serve) is false, when it is.
+    pub fn explain_cannot_serve(&self, model: &crate::models::DiscoveredModel) -> String {
+        if let Some(kind) = crate::models::registry_kind(&model.path) {
+            return format!(
+                "{} registry entry {} is not a model file this backend can launch",
+                kind.label(),
+                model.path.display()
+            );
+        }
+        self.local_serve_reason()
+            .unwrap_or("incompatible format")
+            .to_string()
     }
 
     /// Why this backend can't serve local files, if applicable.
@@ -417,6 +460,81 @@ mod tests {
         assert!(Backend::LocalAi.can_serve_local(&ModelFormat::Gguf));
         assert!(Backend::Lemonade.can_serve_local(&ModelFormat::Gguf));
         assert!(!Backend::FastFlowLm.can_serve_local(&ModelFormat::Gguf));
+    }
+
+    fn entry(
+        path: &str,
+        format: crate::models::ModelFormat,
+        source: crate::models::ModelSource,
+    ) -> crate::models::DiscoveredModel {
+        crate::models::DiscoveredModel {
+            name: "model".into(),
+            path: std::path::PathBuf::from(path),
+            mmproj: None,
+            format,
+            size_bytes: 0,
+            quant: None,
+            param_hint: None,
+            source,
+        }
+    }
+
+    #[test]
+    fn registry_entries_are_not_offered_to_file_backends() {
+        use crate::models::{ModelFormat, ModelSource};
+        let cases = [
+            ("ollama:llama3:latest", ModelSource::Ollama),
+            ("lmstudio:nvidia/nemotron", ModelSource::LmStudio),
+            ("lemonade:qwen", ModelSource::Lemonade),
+            ("fastflowlm:phi", ModelSource::FastFlowLm),
+        ];
+        for (path, source) in cases {
+            let model = entry(path, ModelFormat::Gguf, source);
+            for backend in Backend::ALL {
+                assert!(
+                    !backend.can_serve(&model),
+                    "{} must not be offered for {path}",
+                    backend.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_files_offer_only_backends_that_can_launch_them() {
+        use crate::models::{ModelFormat, ModelSource};
+        let gguf = entry(
+            "/home/a/.lmstudio/models/Qwen/model.gguf",
+            ModelFormat::Gguf,
+            ModelSource::LmStudio,
+        );
+        assert!(Backend::LlamaServer.can_serve(&gguf));
+        assert!(Backend::KoboldCpp.can_serve(&gguf));
+        assert!(Backend::LocalAi.can_serve(&gguf));
+        assert!(Backend::Lemonade.can_serve(&gguf));
+        assert!(!Backend::Ollama.can_serve(&gguf));
+        assert!(!Backend::LmStudio.can_serve(&gguf));
+        assert!(!Backend::MlxLm.can_serve(&gguf));
+        assert!(!Backend::Vllm.can_serve(&gguf));
+        assert!(!Backend::FastFlowLm.can_serve(&gguf));
+
+        let mlx = entry(
+            "/home/a/.cache/huggingface/hub/models--mlx/snapshots/abc",
+            ModelFormat::Mlx,
+            ModelSource::HfCache,
+        );
+        assert!(Backend::MlxLm.can_serve(&mlx));
+        assert!(!Backend::LlamaServer.can_serve(&mlx));
+        assert!(!Backend::KoboldCpp.can_serve(&mlx));
+
+        // A Windows drive path is a file on disk, not a registry placeholder.
+        let windows = entry(
+            r"C:\Users\a\.lmstudio\models\foo.gguf",
+            ModelFormat::Gguf,
+            ModelSource::ExtraDir,
+        );
+        assert!(Backend::LlamaServer.can_serve(&windows));
+        assert!(Backend::KoboldCpp.can_serve(&windows));
     }
 
     #[test]

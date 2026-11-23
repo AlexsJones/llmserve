@@ -4,10 +4,55 @@ use crate::models::DiscoveredModel;
 use std::collections::VecDeque;
 use std::io::Read;
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// Process-global `program` → executable path replacements for [`launch`].
+/// The serve integration test points `llama-server` at a fake binary.
+static BINARY_OVERRIDES: Mutex<Vec<(String, PathBuf)>> = Mutex::new(Vec::new());
+
+fn binary_overrides() -> std::sync::MutexGuard<'static, Vec<(String, PathBuf)>> {
+    BINARY_OVERRIDES
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+}
+
+/// Launch `program` from `path` instead of searching `PATH`.
+///
+/// Process-global. Integration tests use this so CI can exercise serve,
+/// readiness, and stop without a real model or inference engine.
+#[doc(hidden)]
+pub fn set_binary_override(program: impl Into<String>, path: impl Into<PathBuf>) {
+    let program = program.into();
+    let path = path.into();
+    let mut overrides = binary_overrides();
+    if let Some(slot) = overrides.iter_mut().find(|(name, _)| name == &program) {
+        slot.1 = path;
+    } else {
+        overrides.push((program, path));
+    }
+}
+
+/// Remove a replacement installed by [`set_binary_override`].
+#[doc(hidden)]
+pub fn clear_binary_override(program: &str) {
+    binary_overrides().retain(|(name, _)| name != program);
+}
+
+fn command_for(program: &str) -> Command {
+    let overridden = binary_overrides()
+        .iter()
+        .find(|(name, _)| name == program)
+        .map(|(_, path)| path.clone());
+    match overridden {
+        Some(path) => Command::new(path),
+        None => Command::new(program),
+    }
+}
 
 const MAX_LOG_LINES: usize = 1000;
 
@@ -266,7 +311,7 @@ pub fn launch_with(
 fn llama_flash_attn_takes_value() -> bool {
     static TAKES_VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *TAKES_VALUE.get_or_init(|| {
-        Command::new("llama-server")
+        command_for("llama-server")
             .args(["--flash-attn", "on", "--version"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -280,7 +325,7 @@ fn launch_llama_server(
     model: &DiscoveredModel,
     preset: &ResolvedPreset,
 ) -> Result<ServerHandle, String> {
-    let mut cmd = Command::new("llama-server");
+    let mut cmd = command_for("llama-server");
     cmd.arg("--model")
         .arg(&model.path)
         .arg("--host")
@@ -332,7 +377,7 @@ fn launch_llama_server(
 }
 
 fn launch_mlx(model: &DiscoveredModel, preset: &ResolvedPreset) -> Result<ServerHandle, String> {
-    let mut cmd = Command::new("python3");
+    let mut cmd = command_for("python3");
     cmd.arg("-m")
         .arg("mlx_lm.server")
         .arg("--model")
@@ -357,7 +402,7 @@ fn launch_koboldcpp(
     model: &DiscoveredModel,
     preset: &ResolvedPreset,
 ) -> Result<ServerHandle, String> {
-    let mut cmd = Command::new("koboldcpp");
+    let mut cmd = command_for("koboldcpp");
     cmd.arg("--model")
         .arg(&model.path)
         .arg("--host")
@@ -401,7 +446,7 @@ fn launch_localai(
         .parent()
         .ok_or_else(|| "Cannot determine model directory".to_string())?;
 
-    let mut cmd = Command::new("local-ai");
+    let mut cmd = command_for("local-ai");
     cmd.arg("run")
         .arg("--models-path")
         .arg(models_dir)
@@ -433,7 +478,7 @@ fn launch_lemonade(
     model: &DiscoveredModel,
     preset: &ResolvedPreset,
 ) -> Result<ServerHandle, String> {
-    let mut cmd = Command::new("lemonade");
+    let mut cmd = command_for("lemonade");
     cmd.arg("load")
         .arg(model.path.to_string_lossy().as_ref())
         .arg("--host")
@@ -558,6 +603,20 @@ mod tests {
             source: crate::models::ModelSource::ExtraDir,
         };
         assert!(is_large_model(&model));
+    }
+
+    #[test]
+    fn binary_override_replaces_only_the_named_program() {
+        let marker = std::env::temp_dir().join(format!(
+            "llmserve-override-{}-llama-server",
+            std::process::id()
+        ));
+        set_binary_override("llama-server", &marker);
+        let program = command_for("llama-server").get_program().to_os_string();
+        clear_binary_override("llama-server");
+        assert_eq!(program, marker.as_os_str());
+        assert_eq!(command_for("koboldcpp").get_program(), "koboldcpp");
+        assert_eq!(command_for("python3").get_program(), "python3");
     }
 
     #[test]

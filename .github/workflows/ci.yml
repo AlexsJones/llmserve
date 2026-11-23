@@ -24,6 +24,10 @@ jobs:
   test:
     name: Test Suite
     runs-on: ${{ matrix.os }}
+    env:
+      # rustc warnings fail the build. Not set on the Clippy job: that flag
+      # also denies Clippy's own warn-by-default lints, which this tree still has.
+      RUSTFLAGS: "-D warnings"
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -63,7 +67,7 @@ jobs:
             ${{ runner.os }}-cargo-target-
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --locked --verbose
 
   fmt:
     name: Rustfmt
@@ -119,11 +123,13 @@ jobs:
             ${{ runner.os }}-cargo-target-
 
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --locked --all-targets --all-features
 
   check:
     name: Cargo Check
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
 
     steps:
       - name: Checkout code
@@ -133,4 +139,4 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Run cargo check
-        run: cargo check --all-targets --all-features
+        run: cargo check --locked --all-targets --all-features

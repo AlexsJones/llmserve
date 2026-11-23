@@ -76,9 +76,9 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.use-cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
+            cross build --locked --release --target ${{ matrix.target }}
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --locked --release --target ${{ matrix.target }}
           fi
 
       - name: Package

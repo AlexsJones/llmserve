@@ -209,8 +209,8 @@ pub struct App {
 }
 
 impl App {
-    pub fn new() -> Self {
-        let config = Config::load();
+    pub fn new() -> Result<Self, crate::config::ConfigLoadError> {
+        let config = Config::load()?;
         let theme = Theme::load();
         let backends = detect_backends();
 
@@ -231,7 +231,7 @@ impl App {
         let filtered: Vec<usize> = (0..models.len()).collect();
         let tree_nodes = build_tree(&models, &config);
 
-        App {
+        Ok(App {
             input_mode: InputMode::Normal,
             focus: Focus::Table,
             should_quit: false,
@@ -273,7 +273,7 @@ impl App {
             status_message: None,
             config,
             theme,
-        }
+        })
     }
 
     pub fn active_backend(&self) -> Option<&DetectedBackend> {
@@ -511,9 +511,11 @@ impl App {
             return;
         };
         self.config.extra_model_dirs.retain(|d| *d != path);
-        self.config.save();
+        self.status_message = match self.config.save() {
+            Ok(()) => Some(format!("Removed {}", path.display())),
+            Err(e) => Some(e),
+        };
         self.rebuild_models();
-        self.status_message = Some(format!("Removed {}", path.display()));
     }
 
     pub fn open_add_dir(&mut self) {
@@ -597,9 +599,11 @@ impl App {
         }
 
         self.config.extra_model_dirs.push(expanded.clone());
-        self.config.save();
+        self.status_message = match self.config.save() {
+            Ok(()) => Some(format!("Added {}", expanded.display())),
+            Err(e) => Some(e),
+        };
         self.rebuild_models();
-        self.status_message = Some(format!("Added {}", expanded.display()));
         self.input_mode = InputMode::Normal;
     }
 
@@ -980,8 +984,10 @@ impl App {
         if let Ok(port) = self.confirm_port_input.parse::<u16>() {
             entry.port = Some(port);
         }
-        self.config.save();
-        self.status_message = Some(format!("Saved defaults for {key}"));
+        self.status_message = match self.config.save() {
+            Ok(()) => Some(format!("Saved defaults for {key}")),
+            Err(e) => Some(e),
+        };
     }
 
     pub fn do_serve(&mut self) {

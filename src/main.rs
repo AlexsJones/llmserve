@@ -60,6 +60,16 @@ fn main() -> io::Result<()> {
         }
     }
 
+    // Load config before taking over the terminal so a parse error is visible
+    // and we never reach a code path that would save defaults over the file.
+    let mut app = match App::new() {
+        Ok(app) => app,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+
     install_panic_hook();
 
     enable_raw_mode()?;
@@ -70,7 +80,7 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal);
+    let result = run(&mut terminal, &mut app);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -83,13 +93,11 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
-    let mut app = App::new();
-
+fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     loop {
-        terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        terminal.draw(|frame| ui::draw(frame, app))?;
 
-        handle_events(&mut app)?;
+        handle_events(app)?;
 
         if app.should_quit {
             if !app.servers.is_empty() {

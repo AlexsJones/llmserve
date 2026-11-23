@@ -29,7 +29,10 @@ Keys (in the TUI):
   1 / 3      toggle sources / logs      t   cycle theme
   q          quit
 
-Config: ~/.config/llmserve/config.toml";
+Config file:
+  Linux    $XDG_CONFIG_HOME/llmserve/config.toml or ~/.config/llmserve/config.toml
+  macOS    ~/Library/Application Support/llmserve/config.toml
+  Windows  %APPDATA%\\llmserve\\config.toml";
 
 /// Restore the terminal even if we panic, so the user's shell isn't left in
 /// raw mode on the alternate screen with no cursor.

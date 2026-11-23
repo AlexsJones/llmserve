@@ -14,7 +14,7 @@
 
 If you're like me, you've got dozens of GGUF and MLX models scattered across LM Studio, HuggingFace cache, and random directories — and you want to quickly spin one up with whichever inference engine happens to be installed. llmserve is the front door for that. It finds your models, finds your backends, and gets out of the way.
 
-It auto-detects locally installed inference engines (llama-server, KoboldCpp, LocalAI, MLX, and more), discovers model files across multiple locations, and lets you launch servers with live log output — all from a single interactive TUI. No config files to write, no CLI flags to remember.
+It auto-detects nine locally installed inference engines (llama-server, KoboldCpp, LocalAI, Lemonade, MLX, Ollama, vLLM, LM Studio, and FastFlowLM), discovers model files across multiple locations, and lets you launch servers with live log output — all from a single interactive TUI. No config files to write, no CLI flags to remember.
 
 > **Sister project:** Use [llmfit](https://github.com/AlexsJones/llmfit) to figure out *which* models fit your hardware, then use llmserve to actually *run* them.
 
@@ -103,13 +103,13 @@ When you press `Enter` on a model, a confirmation dialog opens:
 | `Enter`/`y` | Launch server |
 | `Esc`/`n` | Cancel |
 
-The dialog shows the resolved preset for the selected backend (context size, flash attention, batch size, GPU layers, extra args).
+The dialog shows the resolved preset for the selected backend (context size, flash attention, batch size, GPU layers, extra args). It only cycles backends that can launch the selected entry. A registry row such as `ollama:llama3` or `lmstudio:org/name` is not a file on disk, so llama-server and KoboldCpp are not offered for it. A GGUF that LM Studio saved under its models directory is a normal file and still is.
 
 ---
 
 ## Features
 
-- **Auto-detects inference backends** — llama-server, KoboldCpp, LocalAI, MLX (Apple Silicon), Ollama, vLLM, LM Studio
+- **Auto-detects inference backends** — llama-server, KoboldCpp, LocalAI, Lemonade, MLX (Apple Silicon), Ollama, vLLM, LM Studio, FastFlowLM
 - **Source tree** — collapsible file tree showing all model locations with model counts and green dots for serving models
 - **Add directories live** — press `a`, type a path with tab-completion, and the directory is scanned immediately and persisted to config
 - **Filter by source** — click a source in the tree to show only its models
@@ -127,7 +127,15 @@ The dialog shows the resolved preset for the selected backend (context size, fla
 
 ## Configuration
 
-Config lives at `~/.config/llmserve/config.toml`. Created automatically on first run.
+The file is created on the first successful save. `dirs::config_dir()` decides the directory:
+
+| OS | Path |
+|----|------|
+| Linux | `$XDG_CONFIG_HOME/llmserve/config.toml`, or `~/.config/llmserve/config.toml` when `XDG_CONFIG_HOME` is unset |
+| macOS | `~/Library/Application Support/llmserve/config.toml` |
+| Windows | `%APPDATA%\llmserve\config.toml` |
+
+A file that does not parse is an error. llmserve prints it and leaves the file unchanged, so a later save cannot replace it with defaults. A missing file starts from the defaults below.
 
 ```toml
 # Extra directories to scan for model files
@@ -137,7 +145,8 @@ extra_model_dirs = [
 
 # Global defaults
 preferred_port = 8080
-preferred_host = "0.0.0.0"
+# Loopback by default. Set "0.0.0.0" to listen on every interface.
+preferred_host = "127.0.0.1"
 default_ctx_size = 8192
 flash_attn = true
 
@@ -172,6 +181,13 @@ port = 8080
 [presets.mlx]
 ctx_size = 4096
 port = 8081
+
+[presets.lemonade]
+ctx_size = 4096
+port = 8000
+
+[presets.fastflowlm]
+port = 52625
 ```
 
 | Field | Type | Description |
@@ -189,29 +205,33 @@ port = 8081
 
 ## Backend detection
 
-llmserve detects 7 backends at startup. Backends that can serve local model files are marked with a checkmark:
+llmserve detects 9 backends at startup. On Windows, binary lookup uses `where`; on macOS and Linux it uses `which`.
 
-| Backend | Local GGUF | Local MLX | Detection | Env override |
-|---------|:---:|:---:|-----------|-------------|
-| llama-server | Yes | — | `which llama-server` | — |
-| KoboldCpp | Yes | — | binary + API `:5001` | `KOBOLDCPP_HOST` |
-| LocalAI | Yes | — | binary + API `:8080` + Docker | `LOCALAI_HOST` |
-| MLX | — | Yes | `python3 -c "import mlx_lm"` (macOS) | — |
-| Ollama | — | — | `GET :11434/api/tags` | `OLLAMA_HOST` |
-| vLLM | — | — | binary + API `:8000` | `VLLM_HOST` |
-| LM Studio | — | — | `GET :1234/v1/models` | `LMSTUDIO_HOST` |
+| Backend | Launches a local file | Registry rows | Detection | Env override |
+|---------|------------------------|---------------|-----------|-------------|
+| llama-server | GGUF | — | `llama-server` on `PATH` | — |
+| KoboldCpp | GGUF | — | `koboldcpp` binary, or `GET /api/v1/model` on `:5001` | `KOBOLDCPP_HOST` |
+| LocalAI | GGUF | — | `local-ai` binary, `GET /v1/models` on `:8080`, or a `localai/localai` container | `LOCALAI_HOST` |
+| Lemonade | GGUF | listed as `lemonade:<id>`, not launched | `lemonade` binary, or `GET /api/v1/health` on `127.0.0.1:8000` | `LEMONADE_HOST` |
+| MLX | MLX directory (macOS) | — | `python3 -c "import mlx_lm"` | — |
+| Ollama | — | listed as `ollama:<name>`, not launched | `GET /api/tags` on `:11434` | `OLLAMA_HOST` |
+| vLLM | — | — | `vllm` binary, or `GET /v1/models` on `:8000` | `VLLM_HOST` |
+| LM Studio | — | listed as `lmstudio:<id>` when the file is not already on disk; on-disk GGUF is launched like any other file | `GET /v1/models` on `127.0.0.1:1234` | `LMSTUDIO_HOST` |
+| FastFlowLM | — | listed as `fastflowlm:<id>`, not launched | `flm` binary, or `GET /v1/models` on `127.0.0.1:52625` | `FLM_HOST` |
 
-> Backends that can't serve local files (Ollama, vLLM, LM Studio) are detected but show a clear reason in the serve dialog. They use their own model registries or manage their own servers.
+MLX is passed `--host` as well as `--port`. The default host is `127.0.0.1`. vLLM is detected, and its preset exists, but launch still refuses a local GGUF: vLLM wants a Hugging Face model id.
 
 ## Model discovery
 
-| Source | Default path |
-|--------|-------------|
-| LM Studio | `~/.lmstudio/models/` |
-| llama.cpp | `~/.cache/llm-models/` |
-| HuggingFace/MLX | `~/.cache/huggingface/hub/` (mlx-community repos) |
-| Ollama | Via API |
-| Custom | `extra_model_dirs` in config |
+| Source | Linux and macOS | Windows |
+|--------|-----------------|---------|
+| LM Studio | `~/.lmstudio/models/` and, when present, `~/.cache/lm-studio/models/` | `%USERPROFILE%\.lmstudio\models` when that directory exists, otherwise `%LOCALAPPDATA%\LM Studio\models`. `~\.cache\lm-studio\models` is also scanned when it exists. |
+| llama.cpp | `~/.cache/llm-models/` | `%USERPROFILE%\.cache\llm-models` when that directory exists, otherwise `%LOCALAPPDATA%\llm-models` |
+| llmfit | `~/.cache/llmfit/models/` | `~\.cache\llmfit\models` |
+| Hugging Face MLX | `$HF_HOME/hub` when `HF_HOME` is set, otherwise `~/.cache/huggingface/hub`. Only repos whose folder name contains `mlx` (for example `models--mlx-community--…`) | same |
+| Ollama, Lemonade, FastFlowLM | API. The path is a placeholder (`ollama:<name>`, `lemonade:<id>`, `fastflowlm:<id>`), not a file | same |
+| LM Studio API | `lmstudio:<id>` for models the API lists that were not already found on disk | same |
+| Custom | `extra_model_dirs` in config | same |
 
 ---
 
@@ -233,7 +253,7 @@ src/
   main.rs       — Terminal init/restore, main loop
   lib.rs        — Module exports for integration tests
   app.rs        — App state, input modes, navigation, filtering, serve lifecycle
-  backends.rs   — Backend detection (7 backends: llama-server, KoboldCpp, LocalAI, MLX, Ollama, vLLM, LM Studio)
+  backends.rs   — Backend detection (9 backends: llama-server, KoboldCpp, LocalAI, Lemonade, MLX, Ollama, vLLM, LM Studio, FastFlowLM)
   config.rs     — Config + per-backend presets, load/save TOML
   events.rs     — Crossterm event handling, vim-style keybindings
   models.rs     — Model discovery from disk + APIs
@@ -254,6 +274,10 @@ llmserve is designed as a companion to [llmfit](https://github.com/AlexsJones/ll
 - **llmserve** answers: *"Let me serve this one right now"* — picks a model, picks a backend, launches it
 
 Both share the same TUI patterns (vim keys, ratatui, crossterm) and theme system.
+
+## Roadmap
+
+Milestone feature sets for 0.1, 0.2, and 1.0 are in [ROADMAP.md](ROADMAP.md).
 
 ## License
 

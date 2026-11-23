@@ -129,7 +129,8 @@ impl Default for Config {
         Self {
             extra_model_dirs: Vec::new(),
             preferred_port: 8080,
-            preferred_host: "0.0.0.0".into(),
+            // Loopback, so a fresh install is not reachable from the network.
+            preferred_host: "127.0.0.1".into(),
             use_ctx_size: true,
             default_ctx_size: 8192,
             flash_attn: true,
@@ -261,6 +262,16 @@ mod tests {
     }
 
     #[test]
+    fn default_host_is_loopback() {
+        assert_eq!(Config::default().preferred_host, "127.0.0.1");
+        assert_eq!(Config::default().preset_for("mlx").host, "127.0.0.1");
+        assert_eq!(
+            Config::default().preset_for("llama-server").host,
+            "127.0.0.1"
+        );
+    }
+
+    #[test]
     fn config_roundtrip_toml() {
         let config = Config::default();
         let serialized = toml::to_string_pretty(&config).unwrap();
@@ -277,7 +288,7 @@ mod tests {
         "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.preferred_port, 9999);
-        assert_eq!(config.preferred_host, "0.0.0.0");
+        assert_eq!(config.preferred_host, "127.0.0.1");
         assert_eq!(config.default_ctx_size, 8192);
         // presets should be empty since we didn't specify them and #[serde(default)] fills Default
         // Actually with serde(default), missing fields get Default values

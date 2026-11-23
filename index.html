@@ -18,7 +18,7 @@
       padding: 2rem;
     }
     .container {
-      max-width: 600px;
+      max-width: 720px;
       text-align: center;
     }
     .icon {
@@ -34,6 +34,12 @@
     .tagline {
       color: #8b949e;
       font-size: 1.1rem;
+      margin-bottom: 0.75rem;
+    }
+    .detail {
+      color: #8b949e;
+      font-size: 0.95rem;
+      line-height: 1.5;
       margin-bottom: 2rem;
     }
     .install-box {
@@ -57,6 +63,7 @@
       color: #79c0ff;
       word-break: break-all;
     }
+    .install-box code + code { margin-top: 0.35rem; }
     .install-box + .install-box { margin-top: 1rem; }
     .links {
       margin-top: 1.5rem;
@@ -82,6 +89,11 @@
     <img src="icon.svg" alt="llmserve" class="icon">
     <h1>llmserve</h1>
     <p class="tagline">Any model. Any backend. One TUI to serve them all.</p>
+    <p class="detail">
+      Nine backends: llama-server, KoboldCpp, LocalAI, Lemonade, MLX, Ollama, vLLM, LM Studio, and FastFlowLM.
+      macOS, Linux, and Windows.
+      Models come from disk and from <code>$HF_HOME/hub</code> (or <code>~/.cache/huggingface/hub</code>).
+    </p>
 
     <div class="install-box">
       <label>Quick install (macOS / Linux)</label>
@@ -96,6 +108,13 @@
     <div class="install-box">
       <label>Cargo</label>
       <code>cargo install llmserve</code>
+    </div>
+
+    <div class="install-box">
+      <label>Config</label>
+      <code>Linux: ~/.config/llmserve/config.toml (or $XDG_CONFIG_HOME)</code>
+      <code>macOS: ~/Library/Application Support/llmserve/config.toml</code>
+      <code>Windows: %APPDATA%\llmserve\config.toml</code>
     </div>
 
     <div class="links">

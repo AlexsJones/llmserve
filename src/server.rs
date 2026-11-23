@@ -331,19 +331,25 @@ fn launch_llama_server(
     Ok(make_handle(Backend::LlamaServer, model, preset, child))
 }
 
-fn launch_mlx(model: &DiscoveredModel, preset: &ResolvedPreset) -> Result<ServerHandle, String> {
+fn mlx_command(model: &DiscoveredModel, preset: &ResolvedPreset) -> Command {
     let mut cmd = Command::new("python3");
     cmd.arg("-m")
         .arg("mlx_lm.server")
         .arg("--model")
         .arg(&model.path)
+        .arg("--host")
+        .arg(&preset.host)
         .arg("--port")
         .arg(preset.port.to_string());
 
     for arg in &preset.extra_args {
         cmd.arg(arg);
     }
+    cmd
+}
 
+fn launch_mlx(model: &DiscoveredModel, preset: &ResolvedPreset) -> Result<ServerHandle, String> {
+    let mut cmd = mlx_command(model, preset);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let child = cmd
@@ -558,6 +564,43 @@ mod tests {
             source: crate::models::ModelSource::ExtraDir,
         };
         assert!(is_large_model(&model));
+    }
+
+    #[test]
+    fn mlx_command_passes_host_and_port() {
+        let model = DiscoveredModel {
+            name: "mlx-community/Qwen3-4B-4bit".into(),
+            path: "/models/mlx".into(),
+            mmproj: None,
+            format: crate::models::ModelFormat::Mlx,
+            size_bytes: 0,
+            quant: None,
+            param_hint: None,
+            source: crate::models::ModelSource::HfCache,
+        };
+        let mut preset = Config::default().preset_for("mlx");
+        preset.host = "127.0.0.1".into();
+        preset.port = 8081;
+        preset.extra_args = vec!["--trust-remote-code".into()];
+        let cmd = mlx_command(&model, &preset);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "-m",
+                "mlx_lm.server",
+                "--model",
+                "/models/mlx",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8081",
+                "--trust-remote-code",
+            ]
+        );
     }
 
     #[test]

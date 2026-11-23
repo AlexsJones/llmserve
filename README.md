@@ -137,7 +137,8 @@ extra_model_dirs = [
 
 # Global defaults
 preferred_port = 8080
-preferred_host = "0.0.0.0"
+# Loopback by default. Set "0.0.0.0" to listen on every interface.
+preferred_host = "127.0.0.1"
 default_ctx_size = 8192
 flash_attn = true
 

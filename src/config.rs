@@ -1,7 +1,29 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// `config.toml` exists but could not be read or parsed.
+/// The file on disk is left unchanged.
+#[derive(Debug)]
+pub struct ConfigLoadError {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+impl fmt::Display for ConfigLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "could not load config {}: {}\nllmserve left the file unchanged. Fix it, or move it aside, then start again.",
+            self.path.display(),
+            self.message
+        )
+    }
+}
+
+impl std::error::Error for ConfigLoadError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -145,22 +167,80 @@ impl Config {
         dirs::config_dir().map(|d| d.join("llmserve").join("config.toml"))
     }
 
-    pub fn load() -> Self {
-        Self::config_path()
-            .and_then(|path| fs::read_to_string(path).ok())
-            .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
+    /// Load the user config.
+    ///
+    /// A missing file is a first run: the defaults are returned and a later
+    /// [`save`](Self::save) may create the file. A file that cannot be read
+    /// or parsed is an error. Callers must not replace that file with defaults.
+    pub fn load() -> Result<Self, ConfigLoadError> {
+        match Self::config_path() {
+            Some(path) => Self::load_at(&path),
+            None => Ok(Self::default()),
+        }
     }
 
-    pub fn save(&self) {
-        if let Some(path) = Self::config_path() {
-            if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            if let Ok(s) = toml::to_string_pretty(self) {
-                let _ = fs::write(&path, s);
+    /// Load `path`, or the defaults when `path` does not exist.
+    pub fn load_at(path: &Path) -> Result<Self, ConfigLoadError> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let text = fs::read_to_string(path).map_err(|e| ConfigLoadError {
+            path: path.to_path_buf(),
+            message: format!("could not read file: {e}"),
+        })?;
+        toml::from_str(&text).map_err(|e| ConfigLoadError {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })
+    }
+
+    /// Write this config to the user config path.
+    ///
+    /// Refuses to replace a file that is already there and does not parse, so
+    /// a bad config loaded as defaults can never be saved back over the user's
+    /// file.
+    pub fn save(&self) -> Result<(), String> {
+        match Self::config_path() {
+            Some(path) => self.save_at(&path),
+            None => Err("could not determine a config directory".into()),
+        }
+    }
+
+    /// Write this config to `path`, creating parent directories when needed.
+    ///
+    /// See [`save`](Self::save) for the refusal to overwrite an unparseable file.
+    pub fn save_at(&self, path: &Path) -> Result<(), String> {
+        if path.exists() {
+            match fs::read_to_string(path) {
+                Ok(text) => {
+                    if let Err(e) = toml::from_str::<Config>(&text) {
+                        return Err(format!(
+                            "left {} unchanged because it does not parse: {e}",
+                            path.display()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "left {} unchanged because it could not be read: {e}",
+                        path.display()
+                    ));
+                }
             }
         }
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "could not create config directory {}: {e}",
+                        parent.display()
+                    )
+                })?;
+            }
+        }
+        let text =
+            toml::to_string_pretty(self).map_err(|e| format!("could not serialize config: {e}"))?;
+        fs::write(path, text).map_err(|e| format!("could not write {}: {e}", path.display()))
     }
 
     /// Get the preset for a backend, merging with global defaults.
@@ -303,5 +383,101 @@ mod tests {
         assert_eq!(preset.gpu_layers, Some(99));
         assert_eq!(preset.threads, Some(8));
         assert_eq!(preset.extra_args, vec!["--mlock", "--cont-batching"]);
+    }
+
+    struct Tmp {
+        path: PathBuf,
+    }
+
+    impl Tmp {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "llmserve-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn file(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn missing_config_uses_defaults_and_save_creates_it() {
+        let tmp = Tmp::new("missing");
+        let path = tmp.file("config.toml");
+        let loaded = Config::load_at(&path).unwrap();
+        assert_eq!(loaded.preferred_port, Config::default().preferred_port);
+
+        let mut config = loaded;
+        config.preferred_port = 9091;
+        config.save_at(&path).unwrap();
+
+        let again = Config::load_at(&path).unwrap();
+        assert_eq!(again.preferred_port, 9091);
+    }
+
+    #[test]
+    fn invalid_config_is_reported_and_not_overwritten() {
+        let tmp = Tmp::new("invalid");
+        let path = tmp.file("config.toml");
+        // A type error is valid-looking TOML that `Config` cannot accept.
+        // This is the case `toml::from_str().ok()` used to swallow.
+        let original = "\
+# user settings — do not replace this file
+preferred_port = \"not-a-number\"
+extra_model_dirs = [\"/models/kept\"]
+";
+        fs::write(&path, original).unwrap();
+
+        let err = Config::load_at(&path).expect_err("bad toml must not become defaults");
+        let message = err.to_string();
+        assert!(
+            message.contains(&path.display().to_string()),
+            "error should name the file: {message}"
+        );
+        assert!(
+            message.contains("not-a-number") || message.contains("preferred_port"),
+            "error should describe the parse failure: {message}"
+        );
+
+        // The old bug: load fell back to Default, and the next save clobbered the file.
+        let save_err = Config::default()
+            .save_at(&path)
+            .expect_err("save must refuse");
+        assert!(
+            save_err.contains("unchanged"),
+            "refusal should say the file was left alone: {save_err}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn unreadable_config_is_reported_and_not_overwritten() {
+        let tmp = Tmp::new("unreadable");
+        // A directory where the file should be cannot be read as TOML.
+        let path = tmp.file("config.toml");
+        fs::create_dir_all(&path).unwrap();
+
+        let err = Config::load_at(&path).expect_err("unreadable path must not become defaults");
+        assert!(err.to_string().contains(&path.display().to_string()));
+
+        let save_err = Config::default()
+            .save_at(&path)
+            .expect_err("save must refuse");
+        assert!(save_err.contains("unchanged"), "{save_err}");
+        assert!(path.is_dir(), "save must not replace the path");
     }
 }

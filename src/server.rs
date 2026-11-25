@@ -231,16 +231,15 @@ pub fn launch_with(
     backend: &Backend,
     preset: &ResolvedPreset,
 ) -> Result<ServerHandle, String> {
-    // Check compatibility: can this backend serve this local model file?
-    if !backend.can_serve_local(&model.format) {
-        let reason = backend
-            .local_serve_reason()
-            .unwrap_or("incompatible format");
+    // File backends launch a real path. Registry placeholders such as
+    // `ollama:<name>` are not files, so llama-server and KoboldCpp must not
+    // be started against them.
+    if !backend.can_serve(model) {
         return Err(format!(
-            "{} cannot serve local {} files: {}",
+            "{} cannot serve {}: {}",
             backend.label(),
-            model.format,
-            reason
+            model.name,
+            backend.explain_cannot_serve(model)
         ));
     }
 
@@ -595,6 +594,58 @@ mod tests {
         let result = launch(&model, &Backend::Ollama, &config);
         assert!(result.is_err());
         assert!(result.err().unwrap().contains("registry"));
+    }
+
+    #[test]
+    fn file_backends_reject_registry_placeholders_before_spawn() {
+        let config = Config::default();
+        let cases = [
+            (
+                Backend::LlamaServer,
+                "ollama:llama3:latest",
+                crate::models::ModelSource::Ollama,
+            ),
+            (
+                Backend::KoboldCpp,
+                "lmstudio:nvidia/nemotron",
+                crate::models::ModelSource::LmStudio,
+            ),
+            (
+                Backend::Lemonade,
+                "lemonade:qwen",
+                crate::models::ModelSource::Lemonade,
+            ),
+            (
+                Backend::LocalAi,
+                "fastflowlm:phi",
+                crate::models::ModelSource::FastFlowLm,
+            ),
+        ];
+        for (backend, path, source) in cases {
+            let model = DiscoveredModel {
+                name: "registry-model".into(),
+                path: path.into(),
+                mmproj: None,
+                format: crate::models::ModelFormat::Gguf,
+                size_bytes: 0,
+                quant: None,
+                param_hint: None,
+                source,
+            };
+            let err = match launch(&model, &backend, &config) {
+                Err(err) => err,
+                Ok(_) => panic!("launch must fail for {path}"),
+            };
+            assert!(
+                err.contains("registry entry"),
+                "{path} via {}: {err}",
+                backend.label()
+            );
+            assert!(
+                !err.contains("Failed to start"),
+                "must not try to spawn a process for {path}: {err}"
+            );
+        }
     }
 
     #[test]

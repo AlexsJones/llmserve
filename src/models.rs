@@ -45,6 +45,67 @@ impl fmt::Display for ModelSource {
     }
 }
 
+/// A model that lives in a backend's own registry rather than on disk.
+///
+/// These show up with a placeholder path such as `ollama:llama3:latest` or
+/// `lmstudio:org/name`. A Windows path like `C:\models\foo.gguf` is not one
+/// of these: it is absolute, or its prefix is not a known registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryKind {
+    Ollama,
+    LmStudio,
+    Lemonade,
+    FastFlowLm,
+}
+
+impl RegistryKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            RegistryKind::Ollama => "Ollama",
+            RegistryKind::LmStudio => "LM Studio",
+            RegistryKind::Lemonade => "Lemonade",
+            RegistryKind::FastFlowLm => "FastFlowLM",
+        }
+    }
+
+    fn prefix(self) -> &'static str {
+        match self {
+            RegistryKind::Ollama => "ollama",
+            RegistryKind::LmStudio => "lmstudio",
+            RegistryKind::Lemonade => "lemonade",
+            RegistryKind::FastFlowLm => "fastflowlm",
+        }
+    }
+
+    pub fn placeholder(self, id: &str) -> PathBuf {
+        PathBuf::from(format!("{}:{id}", self.prefix()))
+    }
+}
+
+/// `Some` when `path` is a registry placeholder (`ollama:<id>` and the like).
+///
+/// The id may contain slashes (`lmstudio:org/name`). Real filesystem paths,
+/// including Windows drive paths, return `None`.
+pub fn registry_kind(path: &Path) -> Option<RegistryKind> {
+    if path.is_absolute() {
+        return None;
+    }
+    let s = path.to_str()?;
+    let (prefix, id) = s.split_once(':')?;
+    // A slash in the prefix means the colon is not the registry separator
+    // (for example `dir/ollama:name`, or a non-absolute `C:\models\...` on Unix).
+    if id.is_empty() || prefix.contains('/') || prefix.contains('\\') {
+        return None;
+    }
+    match prefix {
+        "ollama" => Some(RegistryKind::Ollama),
+        "lmstudio" => Some(RegistryKind::LmStudio),
+        "lemonade" => Some(RegistryKind::Lemonade),
+        "fastflowlm" => Some(RegistryKind::FastFlowLm),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DiscoveredModel {
     pub name: String,
@@ -351,7 +412,7 @@ pub fn add_lmstudio_models(models: &mut Vec<DiscoveredModel>, api_models: Vec<(S
         }
         models.push(DiscoveredModel {
             name: id.clone(),
-            path: PathBuf::from(format!("lmstudio:{id}")),
+            path: RegistryKind::LmStudio.placeholder(&id),
             mmproj: None,
             format: ModelFormat::Gguf,
             size_bytes: size,
@@ -367,7 +428,7 @@ pub fn add_lemonade_models(models: &mut Vec<DiscoveredModel>, api_models: Vec<(S
     for (id, size) in api_models {
         models.push(DiscoveredModel {
             name: id.clone(),
-            path: PathBuf::from(format!("lemonade:{id}")),
+            path: RegistryKind::Lemonade.placeholder(&id),
             mmproj: None,
             format: ModelFormat::Gguf,
             size_bytes: size,
@@ -383,7 +444,7 @@ pub fn add_fastflowlm_models(models: &mut Vec<DiscoveredModel>, api_models: Vec<
     for (id, size) in api_models {
         models.push(DiscoveredModel {
             name: id.clone(),
-            path: PathBuf::from(format!("fastflowlm:{id}")),
+            path: RegistryKind::FastFlowLm.placeholder(&id),
             mmproj: None,
             format: ModelFormat::Gguf,
             size_bytes: size,
@@ -399,7 +460,7 @@ pub fn add_ollama_models(models: &mut Vec<DiscoveredModel>, ollama_models: Vec<(
     for (name, size) in ollama_models {
         models.push(DiscoveredModel {
             name: name.clone(),
-            path: PathBuf::from(format!("ollama:{name}")),
+            path: RegistryKind::Ollama.placeholder(&name),
             mmproj: None,
             format: ModelFormat::Gguf,
             size_bytes: size,
@@ -934,5 +995,33 @@ mod tests {
         );
 
         fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn registry_placeholders_are_recognized() {
+        assert_eq!(
+            registry_kind(Path::new("ollama:llama3:latest")),
+            Some(RegistryKind::Ollama)
+        );
+        assert_eq!(
+            registry_kind(&RegistryKind::LmStudio.placeholder("publisher/model")),
+            Some(RegistryKind::LmStudio)
+        );
+        assert_eq!(
+            registry_kind(&RegistryKind::Lemonade.placeholder("qwen")),
+            Some(RegistryKind::Lemonade)
+        );
+        assert_eq!(
+            registry_kind(&RegistryKind::FastFlowLm.placeholder("phi")),
+            Some(RegistryKind::FastFlowLm)
+        );
+        // A drive path is a file, on Windows (absolute) and on Unix (unknown prefix).
+        assert_eq!(registry_kind(Path::new(r"C:\models\foo.gguf")), None);
+        assert_eq!(
+            registry_kind(Path::new("/home/a/.lmstudio/models/foo.gguf")),
+            None
+        );
+        assert_eq!(registry_kind(Path::new("model.gguf")), None);
+        assert_eq!(registry_kind(Path::new("ollama:")), None);
     }
 }

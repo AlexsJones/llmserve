@@ -5,7 +5,7 @@ use crate::backends::{
 use crate::config::{Config, ResolvedPreset};
 use crate::models::{
     DiscoveredModel, ModelFormat, ModelSource, add_fastflowlm_models, add_lemonade_models,
-    add_lmstudio_models, add_ollama_models, discover_models, hf_hub_dir,
+    add_lmstudio_models, add_ollama_models, discover_models, hf_hub_dir, registry_kind,
 };
 use crate::server::{self, ServerHandle};
 use crate::theme::Theme;
@@ -741,22 +741,26 @@ impl App {
     // -- Serve --
 
     pub fn open_confirm_serve(&mut self) {
-        let Some(model) = self.selected_model() else {
+        let Some(model) = self.selected_model().cloned() else {
             return;
         };
-        let format = model.format.clone();
+        let indices = servable_backend_indices(&self.backends, &model);
+        if indices.is_empty() {
+            self.status_message = Some(unservable_message(&model));
+            return;
+        }
         let model_ctx = if model.path.extension().is_some_and(|e| e == "gguf") {
             crate::models::read_gguf_meta(&model.path).and_then(|m| m.context_length)
         } else {
             None
         };
 
-        // Pre-select the first compatible + available backend
-        let best = self
-            .backends
+        // Pre-select the first launchable backend that is actually installed.
+        let best = indices
             .iter()
-            .position(|b| b.available && b.backend.can_serve_local(&format))
-            .unwrap_or(self.selected_backend);
+            .copied()
+            .find(|&i| self.backends[i].available)
+            .unwrap_or(indices[0]);
 
         self.confirm_backend_idx = best;
         self.confirm_port_input = self.next_available_port().to_string();
@@ -786,7 +790,7 @@ impl App {
             .unwrap_or(self.next_available_port())
     }
 
-    /// Whether the selected backend is compatible with the selected model's format.
+    /// Whether the selected backend can launch the selected model entry.
     pub fn confirm_compatible(&self) -> bool {
         let Some(model) = self.selected_model() else {
             return false;
@@ -794,13 +798,17 @@ impl App {
         let Some(backend) = self.confirm_backend() else {
             return false;
         };
-        backend.backend.can_serve_local(&model.format)
+        backend.backend.can_serve(model)
     }
 
-    /// Reason the selected backend can't serve local files, if any.
-    pub fn confirm_incompatible_reason(&self) -> Option<&'static str> {
-        self.confirm_backend()
-            .and_then(|b| b.backend.local_serve_reason())
+    /// Reason the selected backend can't launch this entry, if any.
+    pub fn confirm_incompatible_reason(&self) -> Option<String> {
+        let model = self.selected_model()?;
+        let backend = self.confirm_backend()?;
+        if backend.backend.can_serve(model) {
+            return None;
+        }
+        Some(backend.backend.explain_cannot_serve(model))
     }
 
     pub fn confirm_already_serving(&self) -> bool {
@@ -816,21 +824,30 @@ impl App {
     }
 
     pub fn confirm_cycle_backend_right(&mut self) {
-        if !self.backends.is_empty() {
-            self.confirm_backend_idx = (self.confirm_backend_idx + 1) % self.backends.len();
-            self.confirm_reseed_preset();
-        }
+        self.confirm_cycle_backend(1);
     }
 
     pub fn confirm_cycle_backend_left(&mut self) {
-        if !self.backends.is_empty() {
-            self.confirm_backend_idx = if self.confirm_backend_idx == 0 {
-                self.backends.len() - 1
-            } else {
-                self.confirm_backend_idx - 1
-            };
-            self.confirm_reseed_preset();
+        self.confirm_cycle_backend(-1);
+    }
+
+    /// Cycle through backends that can launch the selected entry.
+    fn confirm_cycle_backend(&mut self, step: isize) {
+        let Some(model) = self.selected_model().cloned() else {
+            return;
+        };
+        let indices = servable_backend_indices(&self.backends, &model);
+        if indices.is_empty() {
+            return;
         }
+        let pos = indices
+            .iter()
+            .position(|&i| i == self.confirm_backend_idx)
+            .unwrap_or(0);
+        let len = indices.len() as isize;
+        let next = (pos as isize + step).rem_euclid(len) as usize;
+        self.confirm_backend_idx = indices[next];
+        self.confirm_reseed_preset();
     }
 
     pub fn confirm_selected_field(&self) -> ConfirmField {
@@ -1006,12 +1023,12 @@ impl App {
             return;
         }
 
-        if !backend.backend.can_serve_local(&model.format) {
-            let reason = backend
-                .backend
-                .local_serve_reason()
-                .unwrap_or("incompatible format");
-            self.status_message = Some(format!("{}: {}", backend.backend.label(), reason));
+        if !backend.backend.can_serve(&model) {
+            self.status_message = Some(format!(
+                "{}: {}",
+                backend.backend.label(),
+                backend.backend.explain_cannot_serve(&model)
+            ));
             return;
         }
 
@@ -1292,6 +1309,28 @@ fn first_available(backends: &[DetectedBackend]) -> usize {
     backends.iter().position(|b| b.available).unwrap_or(0)
 }
 
+/// Indexes of backends that can actually launch `model`.
+fn servable_backend_indices(backends: &[DetectedBackend], model: &DiscoveredModel) -> Vec<usize> {
+    backends
+        .iter()
+        .enumerate()
+        .filter(|(_, detected)| detected.backend.can_serve(model))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn unservable_message(model: &DiscoveredModel) -> String {
+    match registry_kind(&model.path) {
+        Some(kind) => format!(
+            "{} is a {} registry entry ({}); no backend can launch it",
+            model.name,
+            kind.label(),
+            model.path.display()
+        ),
+        None => format!("No backend can serve this {} model", model.format),
+    }
+}
+
 /// Fetch model lists from all available API-backed backends concurrently
 /// (each fetch has an 800ms timeout, so serial fetching would stack up)
 /// and merge them into `models`.
@@ -1510,5 +1549,150 @@ fn shorten_path(path: &PathBuf, home: &PathBuf) -> String {
         format!("~/{}", stripped.display())
     } else {
         path.display().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::{Backend, DetectedBackend};
+    use crate::theme::Theme;
+
+    fn sample(name: &str, path: &str, format: ModelFormat, source: ModelSource) -> DiscoveredModel {
+        DiscoveredModel {
+            name: name.into(),
+            path: PathBuf::from(path),
+            mmproj: None,
+            format,
+            size_bytes: 0,
+            quant: None,
+            param_hint: None,
+            source,
+        }
+    }
+
+    fn installed_backends() -> Vec<DetectedBackend> {
+        Backend::ALL
+            .into_iter()
+            .map(|backend| DetectedBackend {
+                backend,
+                available: true,
+                binary_path: None,
+                api_url: None,
+            })
+            .collect()
+    }
+
+    fn app_with(model: DiscoveredModel) -> App {
+        let config = Config::default();
+        App {
+            input_mode: InputMode::Normal,
+            focus: Focus::Table,
+            should_quit: false,
+            filtered: vec![0],
+            selected: 0,
+            scroll_offset: 0,
+            visible_rows: 20,
+            search_query: String::new(),
+            format_filter: FormatFilter::All,
+            sort_order: SortOrder::Name,
+            backends: installed_backends(),
+            selected_backend: 0,
+            backend_popup_cursor: 0,
+            servers: Vec::new(),
+            stop_popup_cursor: 0,
+            dead_logs: VecDeque::new(),
+            exit_popups: VecDeque::new(),
+            exit_popup_scroll: 0,
+            confirm_backend_idx: 0,
+            confirm_port_input: String::new(),
+            confirm_preset: config.preset_for("llama-server"),
+            confirm_field: 0,
+            confirm_model_ctx: None,
+            confirm_editing: false,
+            confirm_edit_buf: String::new(),
+            tree_nodes: Vec::new(),
+            tree_cursor: 0,
+            tree_source_filter: None,
+            tree_width: 30,
+            serve_width: 38,
+            log_wrap: false,
+            log_scroll: 0,
+            show_tree: true,
+            show_serve: false,
+            add_dir_input: String::new(),
+            add_dir_completions: Vec::new(),
+            add_dir_completion_idx: 0,
+            status_message: None,
+            models: vec![model],
+            config,
+            theme: Theme::Default,
+        }
+    }
+
+    #[test]
+    fn registry_entry_does_not_open_llama_server_or_koboldcpp() {
+        let mut app = app_with(sample(
+            "llama3:latest",
+            "ollama:llama3:latest",
+            ModelFormat::Gguf,
+            ModelSource::Ollama,
+        ));
+        app.open_confirm_serve();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        let status = app.status_message.expect("status explains the refusal");
+        assert!(status.contains("Ollama"), "{status}");
+        assert!(status.contains("ollama:llama3:latest"), "{status}");
+
+        let mut lm = app_with(sample(
+            "nemotron",
+            "lmstudio:nvidia/nemotron",
+            ModelFormat::Gguf,
+            ModelSource::LmStudio,
+        ));
+        lm.open_confirm_serve();
+        assert_eq!(lm.input_mode, InputMode::Normal);
+        let status = lm.status_message.expect("status");
+        assert!(status.contains("LM Studio"), "{status}");
+        assert!(status.contains("lmstudio:nvidia/nemotron"), "{status}");
+    }
+
+    #[test]
+    fn local_gguf_cycles_only_backends_that_can_launch_it() {
+        let mut app = app_with(sample(
+            "qwen",
+            "/models/qwen.gguf",
+            ModelFormat::Gguf,
+            ModelSource::ExtraDir,
+        ));
+        app.open_confirm_serve();
+        assert_eq!(app.input_mode, InputMode::ConfirmServe);
+        assert_eq!(
+            app.confirm_backend().map(|b| b.backend.clone()),
+            Some(Backend::LlamaServer)
+        );
+
+        // Ollama sits between llama-server and KoboldCpp in the full list.
+        // The dialog must skip it, and every other backend that cannot load a file.
+        app.confirm_cycle_backend_right();
+        assert_eq!(
+            app.confirm_backend().map(|b| b.backend.clone()),
+            Some(Backend::KoboldCpp)
+        );
+        app.confirm_cycle_backend_right();
+        assert_eq!(
+            app.confirm_backend().map(|b| b.backend.clone()),
+            Some(Backend::LocalAi)
+        );
+        app.confirm_cycle_backend_right();
+        assert_eq!(
+            app.confirm_backend().map(|b| b.backend.clone()),
+            Some(Backend::Lemonade)
+        );
+        app.confirm_cycle_backend_right();
+        assert_eq!(
+            app.confirm_backend().map(|b| b.backend.clone()),
+            Some(Backend::LlamaServer)
+        );
     }
 }
